@@ -103,6 +103,17 @@ def combine_quotes(kalshi: list[Quote], polymarket: list[Quote], aliases: dict |
         cards.append(MarketCard(ps[0].event_title, ps[0].category,
                                 [Row(p.outcome, None, p) for p in ps],
                                 sum(q.volume for q in ps), False))
-    # Incomplete matches retain unmatched outcome rows rather than silently concealing them.
-    cards.sort(key=lambda c:(not c.matched, -c.volume))
-    return cards
+    # Show each exchange in the first screen even when they have no cross-exchange match.
+    # Sorting by pooled volume incorrectly mixes Kalshi contract counts with Polymarket USD.
+    matched_cards=[c for c in cards if c.matched]
+    only_k=[c for c in cards if not c.matched and any(r.kalshi for r in c.rows)]
+    only_p=[c for c in cards if not c.matched and any(r.polymarket for r in c.rows)]
+    matched_cards.sort(key=lambda c:-c.volume)  # approximate within matched events only
+    only_k.sort(key=lambda c:-c.volume)          # within-exchange ordering
+    only_p.sort(key=lambda c:-c.volume)
+    # Alternation prevents one exchange from taking every initial dashboard card.
+    mixed=[]
+    for i in range(max(len(only_k),len(only_p))):
+        if i<len(only_k): mixed.append(only_k[i])
+        if i<len(only_p): mixed.append(only_p[i])
+    return matched_cards+mixed

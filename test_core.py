@@ -49,3 +49,53 @@ def test_recency_weight_decay():
     now=datetime(2026,10,30,tzinfo=timezone.utc)
     assert recency_weight(datetime(2026,10,30,tzinfo=timezone.utc),now)==1
     assert abs(recency_weight(datetime(2025,4,30,tzinfo=timezone.utc),now)-.5)<.03
+
+
+def test_polymarket_fetch_reads_nested_event(monkeypatch):
+    import feeds
+    ev = {'id':'evt-1', 'slug':'championship-2026',
+          'title':'Who will win the NBA Finals?', 'tags':[{'label':'Sports'}],
+          'markets':[{'id':'m-1', 'active':True, 'closed':False,
+                      'groupItemTitle':'Team A',
+                      'outcomes':'["Yes", "No"]',
+                      'outcomePrices':'["0.73", "0.27"]'}]}
+    monkeypatch.setattr(feeds,'session',lambda:object())
+    monkeypatch.setattr(feeds,'get_json',lambda session,url,params:[ev])
+    quotes,meta=feeds.fetch_polymarket(3)
+    assert len(quotes)==1
+    assert quotes[0].exchange=='Polymarket'
+    assert quotes[0].outcome=='Yes' # Single binary event, show YES
+    assert quotes[0].probability==.73
+    assert meta['endpoint']=='/events'
+    assert meta['complete']
+
+
+def test_polymarket_market_fallback(monkeypatch):
+    import feeds
+    m={'id':'44', 'active':True, 'closed':False,
+       'question':'Will there be a major hurricane?',
+       'slug':'major-hurricane',
+       'outcomes':'["Yes","No"]',
+       'outcomePrices':'["0.35","0.65"]'}
+    calls=[]
+    def fake_get_json(session,url,params):
+        calls.append(url)
+        if url.endswith('/events'):
+            raise feeds.FeedError('simulated /events API problem')
+        return [m]
+    monkeypatch.setattr(feeds,'session',lambda:object())
+    monkeypatch.setattr(feeds,'get_json',fake_get_json)
+    quotes,meta=feeds.fetch_polymarket(2)
+    assert any('/events' in url for url in calls)
+    assert any('/markets' in url for url in calls)
+    assert len(quotes)==1 and abs(quotes[0].probability-.35)<1e-9
+    assert meta['endpoint']=='/markets (fallback)'
+
+
+def test_unmatched_market_cards_show_both_exchanges_at_top():
+    kalshi=[q('Kalshi','Team A',.7,event_id='k'+str(i),title='Kalshi event '+str(i)) for i in range(3)]
+    polymarket=[q('Polymarket','Team B',.4,event_id='p'+str(i),title='Polymarket event '+str(i)) for i in range(3)]
+    cards=combine_quotes(kalshi,polymarket)
+    assert len(cards)==6
+    assert [cards[i].rows[0].kalshi is not None for i in range(4)]==[True,False,True,False]
+    assert [cards[i].rows[0].polymarket is not None for i in range(4)]==[False,True,False,True]

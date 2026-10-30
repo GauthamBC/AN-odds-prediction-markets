@@ -122,7 +122,11 @@ with st.spinner('Loading markets from public APIs…'):
     live,meta,errors,fetched_at = load_live(pages)
 st.caption(f'Last successful fetch attempt: {datetime.fromisoformat(fetched_at):%d %b %Y, %H:%M:%S} UTC')
 for key,error in errors.items():
-    st.warning(f'{key} feed unavailable: {error}. Other feed may still be accessible.')
+    st.error(f'{key} feed unavailable: {error}. This is an API issue, not a missing market match.')
+if not live['Polymarket']:
+    st.error('**No Polymarket prices were retrieved.** The dashboard cannot calculate AN blends. Check the Polymarket feed error above and the source diagnostics below.')
+elif not live['Kalshi']:
+    st.warning('Kalshi quotes are unavailable; showing Polymarket-only markets.')
 if not live['Kalshi'] and not live['Polymarket']:
     st.error('No live data could be retrieved. This app requires a deployed server with outbound access to the official exchange APIs. No example predictions have been substituted.')
     st.stop()
@@ -138,6 +142,18 @@ if alias_file.exists():
 cards = combine_quotes(live['Kalshi'],live['Polymarket'],aliases)
 model = AccuracyModel(read_history(history_file))
 matched = sum(1 for c in cards if c.matched)
+
+# Prominent diagnostics: a working feed is not the same thing as a successful match.
+with st.expander('Live source diagnostics and matching — check here if a column is empty',expanded=not bool(live['Polymarket'])):
+    for exchange in ('Kalshi','Polymarket'):
+        source_meta=meta[exchange]
+        st.write(f"**{exchange}:** {len(live[exchange]):,} usable outcome quotes · "
+                 f"{source_meta.get('events_scanned',0):,} scanned · "
+                 f"endpoint {source_meta.get('endpoint','/events')} · "
+                 f"{source_meta.get('contracts_skipped',0):,} skipped · "
+                 f"{'complete' if source_meta.get('complete') else 'partial'} scan")
+    st.write(f"**Matched events:** {matched:,}. When title, candidate name, cutoff date or settlement rules differ, we leave the opposite column blank rather than guess.")
+    st.write('**Troubleshooting:** Choose **Polymarket markets** in Coverage to confirm that it works independently of Kalshi. Increase API pages for broader discovery. Use **Matched pairs** to see only legitimate side-by-side comparisons.')
 
 mc = st.columns(4)
 for col,title,value in zip(mc,['Events displayed','Cross-platform matched','Kalshi contract quotes','Polymarket contract quotes'],
@@ -159,7 +175,7 @@ st.markdown('<div class="an-divider"></div>',unsafe_allow_html=True)
 filter_col, category_col, source_col, format_col = st.columns([3.1,2.1,1.4,1.15],vertical_alignment='bottom')
 with filter_col: search = st.text_input('Search markets',placeholder='Search events, outcomes, teams...',label_visibility='visible')
 with category_col: chosen = st.selectbox('Category',['All categories',*CATEGORY_NAMES])
-with source_col: source_view = st.selectbox('Coverage',['All markets','Both exchanges','Kalshi only','Polymarket only'])
+with source_col: source_view = st.selectbox('Coverage',['All markets (mixed)','Matched pairs','Kalshi markets','Polymarket markets','Kalshi only','Polymarket only'])
 with format_col: layout = st.radio('Layout',['Grid','Table'],horizontal=True)
 
 filtered=[]
@@ -168,12 +184,14 @@ for c in cards:
     if search and search.lower() not in (c.title+' '+' '.join(r.label for r in c.rows)).lower(): continue
     k_count=sum(x.kalshi is not None for x in c.rows)
     p_count=sum(x.polymarket is not None for x in c.rows)
-    if source_view == 'Both exchanges' and not c.matched: continue
+    if source_view == 'Matched pairs' and not c.matched: continue
+    if source_view == 'Kalshi markets' and not k_count: continue
+    if source_view == 'Polymarket markets' and not p_count: continue
     if source_view == 'Kalshi only' and (not k_count or p_count): continue
     if source_view == 'Polymarket only' and (not p_count or k_count): continue
     filtered.append(c)
 
-st.caption(f'{len(filtered):,} events match filters · {sum(c.matched for c in filtered):,} matched events · Unmatched events remain visible with blanks for unavailable values')
+st.caption(f'{len(filtered):,} events match filters · {sum(c.matched for c in filtered):,} matched events · All markets view alternates single-source Kalshi and Polymarket events; a blank opposite column means no verified match')
 
 if 'last_filter' not in st.session_state:st.session_state.last_filter=None
 filter_token=(search,chosen,source_view,layout,pages)
@@ -284,7 +302,7 @@ with st.expander('Methodology, model training and critical limitations'):
 
 **Matching:** cross-platform contracts may differ in timing, outcome definition, fees, void rules and settlement policies. Matching uses conservative titles, outcome labels and dates; it **cannot guarantee** identical rules. Always verify source contracts.
 
-**Coverage:** API pagination determines what has been scanned. A partial scan must never be described as all active exchange markets. Some newly listed or thin markets do not have usable price fields.
+**Coverage:** The mixed dashboard alternates unmatched Kalshi and Polymarket events. Both feeds must return usable quotes before a blended AN estimate can be made. A missing opposite exchange quote is not a zero probability. API pagination determines what has been scanned. A partial scan must never be described as all active exchange markets. Some newly listed or thin markets do not have usable price fields.
 
 **Volume:** Kalshi volume counts contracts, while Polymarket volume is often USD-denominated. For that reason this interface's combined volume is **only a rough ranking heuristic**, not a meaningful pooled dollar volume. Do not cite combined totals externally.
 

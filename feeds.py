@@ -129,22 +129,94 @@ def _poly_market(m, event):
     return quote_list
 
 
-def fetch_polymarket(max_pages=4):
-    s = session()
-    quotes = []
-    fetched = 0
-    exhausted = False
+def _poly_from_market_listing(m):
+    """Normalize a standalone Gamma /markets item if /events has no nested quotes."""
+    events = m.get("events") or []
+    event = events[0] if events and isinstance(events[0], dict) else {}
+    event = {"id":str(event.get("id") or m.get("eventId") or m.get("id")),
+             "title":event.get("title") or m.get("question") or "Untitled market",
+             "slug":event.get("slug") or m.get("slug"),
+             "tags":event.get("tags") or m.get("tags") or [],
+             "endDate":event.get("endDate") or m.get("endDate"),
+             "markets":[m]}
+    return _poly_market(m, event)
+
+
+def _poly_events(s, max_pages, order=None):
+    quotes, scanned, skipped, exhausted = [], 0, 0, False
     for page in range(max_pages):
-        params = {"active":"true", "closed":"false", "limit":100, "offset":page*100,
-                  "order":"volume_24hr", "ascending":"false"}
+        params = {"active":"true", "closed":"false", "limit":100, "offset":page*100}
+        if order:
+            params.update({"order":order,"ascending":"false"})
         events = get_json(s, f"{POLY}/events", params)
         if not isinstance(events, list):
-            raise FeedError("Polymarket events API returned an unexpected structure")
-        fetched += len(events)
-        for e in events:
-            for m in e.get("markets", []):
-                quotes.extend(_poly_market(m, e))
+            raise FeedError("Polymarket /events returned unexpected JSON (expected list)")
+        scanned += len(events)
+        for event in events:
+            if not isinstance(event,dict):
+                skipped += 1
+                continue
+            nested = event.get("markets") or []
+            if not isinstance(nested,list):
+                skipped += 1
+                continue
+            for m in nested:
+                if isinstance(m,dict):
+                    parsed = _poly_market(m,event)
+                    quotes.extend(parsed)
+                    if not parsed: skipped += 1
         if len(events) < 100:
-            exhausted = True
+            exhausted=True
             break
-    return quotes, {"events_scanned":fetched, "complete":exhausted}
+    return quotes, {"events_scanned":scanned, "contracts_skipped":skipped,
+                    "complete":exhausted, "endpoint":"/events"}
+
+
+def _poly_markets_fallback(s,max_pages):
+    """Official alternate Gamma endpoint when events endpoint supplies no usable prices."""
+    quotes, scanned, skipped, exhausted = [], 0, 0, False
+    for page in range(max_pages):
+        params = {"active":"true", "closed":"false", "limit":100,
+                  "offset":page*100, "order":"volumeNum", "ascending":"false"}
+        markets = get_json(s, f"{POLY}/markets", params)
+        if not isinstance(markets,list):
+            raise FeedError("Polymarket /markets returned unexpected JSON (expected list)")
+        scanned += len(markets)
+        for market in markets:
+            if isinstance(market,dict):
+                parsed=_poly_from_market_listing(market)
+                quotes.extend(parsed)
+                if not parsed: skipped += 1
+        if len(markets)<100:
+            exhausted=True
+            break
+    return quotes,{"events_scanned":scanned, "contracts_skipped":skipped,
+                   "complete":exhausted, "endpoint":"/markets (fallback)"}
+
+
+def fetch_polymarket(max_pages=4):
+    """Public Gamma discovery: ranked events -> unsorted events -> independent markets fallback.
+
+    Record which endpoint succeeded and never manufacture prices if all requests fail.
+    """
+    s=session()
+    errors=[]
+    # Different API versions have accepted different order field spellings.
+    for ordering in ("volume24hr", "volume_24hr", None):
+        try:
+            quotes, meta=_poly_events(s,max_pages,ordering)
+            if quotes:
+                meta["sort"]=ordering or "default"
+                return quotes, meta
+            errors.append(f"/events sort={ordering}: no usable quotes")
+        except FeedError as exc:
+            errors.append(str(exc))
+    try:
+        quotes, meta=_poly_markets_fallback(s,max_pages)
+        if quotes:
+            return quotes,meta
+        errors.append("/markets fallback: no usable quotes")
+    except FeedError as exc:
+        errors.append(str(exc))
+    # Make the failure visible instead of implying unmatched odds are zero.
+    raise FeedError("Polymarket did not return usable quotes. " + " | ".join(errors[-3:]))

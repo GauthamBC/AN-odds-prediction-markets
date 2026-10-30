@@ -1,3 +1,15 @@
+# Update — v1.1: Polymarket visibility and API fallback
+
+The original first screen could look Kalshi-only because unmatched events were sorted together by **non-comparable volume units**, and cross-exchange name matching was strict. This version:
+
+- Alternates Kalshi-only and Polymarket-only cards in the default grid; matched cards come first.
+- Adds **Polymarket markets**, **Kalshi markets** and **Matched pairs** coverage filters.
+- Shows source-level quote counts, endpoint used, skipped data, and connection/parsing errors.
+- Tries Polymarket Gamma `/events` with alternate sorting and a Gamma `/markets` fallback.
+- Leaves the AN column blank unless there is a plausible cross-exchange outcome match. Historical calibration remains unvalidated until legitimate historical outcomes are collected.
+
+**Important:** An empty Polymarket column on a *particular Kalshi event* can be correct: that event may have no matching Polymarket contract, or its rules might differ. A zero Polymarket *quote count*, however, indicates an API or parsing problem. Use the new **Live source diagnostics** expander to distinguish them. If Streamlit Cloud is blocked by Polymarket's edge network, code changes cannot guarantee bypassing that restriction; check the reported HTTP error and network access legitimately.
+
 # AN Odds Studio — internal Streamlit prototype
 
 A dark-mode prediction-markets dashboard with **Kalshi | Polymarket | AN Model** columns, plus fair American moneyline prices, categories, search, grid/table views, CSV export and live refresh.
