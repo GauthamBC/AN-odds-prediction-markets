@@ -1,311 +1,432 @@
-"""Action Network Odds Studio — internal research prototype.
+"""AN Odds Studio | Read-only live dashboard & experimental historical calibration.
 
 Run: streamlit run streamlit_app.py
-Uses public read-only exchange APIs. Not a sportsbook or trading service.
+Live exchange data is separate from the resolved-market historical training CSV.
 """
 from __future__ import annotations
+
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 import csv
 import io
-import os
+import math
+
 import pandas as pd
 import streamlit as st
-from core import CATEGORY_NAMES, american
+
+from core import CATEGORY_NAMES, american, date_from_string
 from feeds import FeedError, fetch_kalshi, fetch_polymarket
 from matching import combine_quotes
 from model import AccuracyModel, read_history
 
-st.set_page_config(page_title="AN Odds Studio • Market Intelligence",page_icon="📈",layout="wide",initial_sidebar_state="collapsed")
+st.set_page_config(
+    page_title="Markets Dashboard | AN Odds Studio",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-STYLE = """
+CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&display=swap');
-html,body,[class*="css"],div[data-testid="stAppViewContainer"] {font-family:'DM Sans',system-ui,sans-serif;}
-.stApp {background:linear-gradient(160deg,#09111C 0%,#090D18 42%,#0D1422 100%);color:#F0F5FE;}
-.block-container {padding-top:1.9rem;max-width:1470px;padding-left:2rem;padding-right:2rem;}
-header[data-testid="stHeader"] {background:transparent;}
-#MainMenu, footer {visibility:hidden;}
-h1,h2,h3 {letter-spacing:-.045em;}
-.stTextInput input {background:#141B2B!important;color:#eff6ff!important;border:1px solid #2D3951!important;}
-div[data-testid="stMetric"]{background:#141B2B;border:1px solid #28354A;border-radius:14px;padding:13px 18px;}
-div[data-testid="stMetricLabel"]{color:#A3B1CA;}
-div[data-testid="stMetricValue"]{font-size:1.35rem;}
-.stButton>button,.stDownloadButton>button {border-radius:9px!important;border:1px solid #34445C;background:#19263A;color:#F1F7FE;}
-.stButton>button:hover {border-color:#42D89B;color:#42D89B;}
-.stSelectbox div[data-baseweb="select"],.stMultiSelect div[data-baseweb="select"] {background:#151e2d;}
-[data-testid="stRadio"] label {font-size:.92rem;}
-.an-topline {color:#52DDA5;font-size:12px;letter-spacing:2px;font-weight:800;margin-bottom:12px;}
-.an-title {font-size:clamp(35px,4vw,57px);font-weight:800;letter-spacing:-2.1px;line-height:1.05;margin:0 0 10px 0;}
-.an-subtitle {color:#A3B2CB;font-size:16px;line-height:1.6;margin-bottom:24px;}
-.an-brand {display:flex;align-items:center;justify-content:space-between;padding-bottom:17px;margin-bottom:27px;border-bottom:1px solid #263147;}
-.an-logo {font-size:20px;font-weight:800;letter-spacing:-.6px;color:#F8FAFC;}
-.an-logo span {color:#42D89B;}
-.an-pilot {font-size:12px;color:#AFC0D8;border:1px solid #30445D;padding:6px 10px;border-radius:99px;}
-.an-feed {padding:19px;border:1px solid #2D3B53;border-radius:14px;background:linear-gradient(115deg,#141E2E,#111827);margin-bottom:20px;min-height:114px;}
-.an-feed-name{font-size:23px;font-weight:800;letter-spacing:-.5px;}
-.an-feed-sub{font-size:13px;color:#A8B8D2;margin-top:11px;}
-.an-divider{height:1px;background:#27354b;margin:15px 0 20px;}
-.an-card {background:#131B2A;border:1px solid #2C3951;border-radius:16px;padding:19px 18px 14px;min-height:260px;margin:0 0 20px;box-shadow:0 6px 18px rgba(0,0,0,.07);}
-.an-card-head {display:flex;justify-content:space-between;gap:15px;min-height:62px;}
-.an-card-title{font-size:17px;line-height:1.34;font-weight:800;letter-spacing:-.3px;color:#F4F7FF;}
-.an-cat{font-size:11px;letter-spacing:1px;text-transform:uppercase;font-weight:700;color:#A7B7D0;margin-top:7px;}
-.an-match {font-size:10px;font-weight:800;white-space:nowrap;color:#46DCA1;border:1px solid #245A53;background:#12382E;padding:5px 7px;border-radius:6px;height:fit-content;}
-.an-onesource {font-size:10px;font-weight:800;white-space:nowrap;color:#F2C179;border:1px solid #5C4B2A;background:#322B1A;padding:5px 7px;border-radius:6px;height:fit-content;}
-.an-matrix {width:100%;border-collapse:collapse;margin-top:11px;table-layout:fixed;}
-.an-matrix thead th{font-size:11px;letter-spacing:.2px;text-align:right;padding:7px 3px 11px;color:#8EA0BD;font-weight:700;border-bottom:1px solid #273449;}
-.an-matrix thead th:first-child{text-align:left;width:40%;}
-.an-matrix tbody td{border-bottom:1px solid #202D43;font-size:13px;padding:11px 4px;text-align:right;vertical-align:middle;}
-.an-matrix tbody tr:last-child td{border-bottom:0;}
-.an-matrix tbody td:first-child{text-align:left;color:#EDF3FD;font-weight:600;word-break:break-word;}
-.an-cell{display:inline-block;border:1px solid #36445F;border-radius:7px;padding:6px 5px;min-width:52px;text-align:center;background:#0D1422;font-weight:800;font-variant-numeric:tabular-nums;}
-.an-kalshi{color:#45DD9C;background:#0D352C;border-color:#17674C;}
-.an-poly{color:#7CB4FF;background:#122C4E;border-color:#235581;}
-.an-model{color:#F8F0C4;background:#42391D;border-color:#72622A;}
-.an-odd{font-size:10px;font-weight:600;opacity:.8;display:block;margin-top:3px;}
-.an-card-foot{font-size:11px;color:#899BB6;border-top:1px solid #273449;padding-top:11px;margin-top:10px;display:flex;justify-content:space-between;gap:5px;}
-.an-card-foot a {color:#A8D4FF;text-decoration:none;}
-.an-card-foot a:hover{text-decoration:underline;}
-.an-note {color:#97A8C5;font-size:12px;line-height:1.55;margin:10px 0 14px;}
-.an-empty{border:1px dashed #40516C;border-radius:14px;padding:32px;text-align:center;color:#B4C2D9;}
-@media(max-width:800px){.block-container{padding-left:.8rem;padding-right:.8rem;}.an-card{padding:12px;}.an-matrix thead th{font-size:9px;}.an-matrix thead th:first-child{width:36%;}.an-matrix tbody td{font-size:11px;}.an-cell{min-width:43px;padding:5px 3px;}}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+:root { color-scheme:dark; }
+html,body,[class*="css"],.stApp,div[data-testid="stAppViewContainer"] {font-family:'Inter',system-ui,sans-serif;}
+.stApp {background:#0b0d16;color:#f9faff;}
+header[data-testid="stHeader"] {background:#0b0d16;}
+#MainMenu,footer {visibility:hidden;}
+.block-container {max-width:1510px;padding:1.0rem 2.05rem 2.8rem;}
+[data-testid="stVerticalBlock"] {gap:.47rem;}
+[data-testid="stElementContainer"]:has(.an-card) {height:100%;}
+[data-testid="stHorizontalBlock"] {gap:1rem;}
+.an-nav {display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #242637;padding:8px 0 16px;margin-bottom:22px;gap:16px;}
+.an-nav-left {display:flex;align-items:center;gap:32px;}
+.an-logo {font-size:18px;letter-spacing:-.75px;font-weight:900;white-space:nowrap;color:#fff;}
+.an-logo-mark {display:inline-flex;width:24px;height:24px;border-radius:7px;background:#25d38c;color:#081b13;align-items:center;justify-content:center;margin-right:7px;transform:skew(-8deg);}
+.an-nav-item {font-size:13px;color:#a5b0c8;font-weight:500;padding:14px 4px;}
+.an-nav-item.active{color:#54e1ad;border-bottom:2px solid #54e1ad;}
+.an-nav-tag {color:#9fb0c8;border:1px solid #32364d;font-size:11px;font-weight:700;border-radius:100px;padding:7px 11px;white-space:nowrap;}
+.an-head {margin:4px 0 13px;}
+.an-title {font-size:clamp(32px,3.55vw,43px);font-weight:850;letter-spacing:-1.7px;line-height:1.15;color:#f7f9ff;}
+.an-subtitle {color:#97a4bf;font-size:14px;margin-top:9px;line-height:1.55;}
+.an-sources {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;margin:16px 0 19px;}
+.an-source {background:#11131e;border:1px solid #34364d;border-radius:13px;min-height:112px;padding:20px 21px 17px;display:flex;flex-direction:column;justify-content:space-between;}
+.an-source-row {display:flex;align-items:center;justify-content:space-between;gap:8px;}
+.an-source-name{font-weight:850;font-size:21px;letter-spacing:-.6px;}
+.an-kname{color:#37d493;}.an-pname{color:#2690ff;}
+.an-source-count{font-size:13px;color:#e3eaf7;font-weight:700;font-variant-numeric:tabular-nums;}
+.an-source-caption{font-size:12px;color:#99a9c6;margin-top:14px;line-height:1.3;}
+.an-rule{height:1px;background:#24283b;margin:5px 0 16px;}
+.an-results {font-size:12px;color:#8191b2;font-variant-numeric:tabular-nums;}
+.an-results b{color:#b6c8e7;}
+.an-mini-info{font-size:11px;color:#8090ad;margin:0 0 9px;}
+/* Form controls: compact horizontal style instead of Streamlit's stacked filters. */
+div[data-testid="stTextInput"] input {height:43px;border-radius:8px;background:#161924;color:#f5f7fb;border:1px solid #34394e;font-size:13px;padding-left:14px;}
+div[data-testid="stTextInput"] input:focus {border-color:#39d8a2;box-shadow:0 0 0 1px #39d8a233;}
+div[data-testid="stTextInput"] label {display:none;}
+div[data-testid="stPills"] button,div[data-testid="stSegmentedControl"] button {border:1px solid #30344a!important;background:#10131f!important;color:#a6b4d2!important;font-size:12px!important;border-radius:20px!important;min-height:32px!important;padding:5px 11px!important;}
+div[data-testid="stSegmentedControl"] button{border-radius:7px!important;}
+div[data-testid="stPills"] button[aria-pressed="true"],div[data-testid="stSegmentedControl"] button[aria-pressed="true"] {background:#24293d!important;color:#fff!important;border-color:#495372!important;font-weight:800;}
+/* Streamlit may use aria-checked in some versions */
+div[data-testid="stPills"] button[aria-checked="true"],div[data-testid="stSegmentedControl"] button[aria-checked="true"] {background:#24293d!important;color:#fff!important;border-color:#495372!important;}
+[data-testid="stPills"] {margin-top:2px;}
+div[data-testid="stButton"] button,div[data-testid="stDownloadButton"] button {background:#161b2a;border:1px solid #353d56;color:#e2ebfc;border-radius:8px;font-size:12px;font-weight:700;min-height:37px;}
+div[data-testid="stButton"] button:hover,div[data-testid="stDownloadButton"] button:hover {border-color:#3cdaaa;color:#44dcaa;}
+/* Comparable to screenshot #1 cards: compact, aligned and easy to scan. */
+.an-card {background:#11131e;border:1px solid #32364b;border-radius:13px;margin:4px 0 13px;padding:17px 17px 14px;min-height:238px;display:flex;flex-direction:column;}
+.an-card-head {display:flex;gap:12px;align-items:flex-start;min-height:58px;}
+.an-icon {width:46px;height:46px;flex:0 0 46px;display:flex;align-items:center;justify-content:center;border-radius:9px;background:linear-gradient(135deg,#493775,#292147);font-size:23px;}
+.an-heading{flex:1;min-width:0;}
+.an-card-title{font-size:14px;font-weight:800;color:#f6f8fe;letter-spacing:-.15px;line-height:1.35;overflow-wrap:anywhere;}
+.an-meta{font-size:11px;color:#93a7cc;margin-top:5px;line-height:1.3;}
+.an-match-chip{font-size:9px;color:#80dfbb;border:1px solid #235c47;background:#103128;border-radius:5px;padding:3px 5px;white-space:nowrap;}
+.an-table{width:100%;border-collapse:collapse;table-layout:fixed;margin-top:11px;}
+.an-table th{font-size:10px;letter-spacing:.55px;font-weight:700;color:#8497c1;padding:10px 3px 11px;text-align:center;border-top:1px solid #252c3f;}
+.an-table th:first-child{text-align:left;width:47%;}
+.an-table td{padding:7px 3px;color:#ecf3ff;font-size:12px;vertical-align:middle;text-align:center;}
+.an-table td:first-child{text-align:left;font-weight:500;overflow-wrap:anywhere;padding-right:7px;}
+.an-table th.an-kalshi-col{color:#43dba1;}.an-table th.an-poly-col{color:#55a0ff;}.an-table th.an-an-col{color:#f8cc70;}
+.an-val{border:1px solid #373c55;display:inline-flex;flex-direction:column;gap:3px;align-items:center;justify-content:center;padding:5px 3px;border-radius:7px;min-width:49px;background:#101520;color:#f5f7ff;font-weight:800;font-size:12px;font-variant-numeric:tabular-nums;}
+.an-val.k{border-color:#1d6c52;background:#0d3b2c;color:#41e3a3;}
+.an-val.p{border-color:#295780;background:#102f4e;color:#66acff;}
+.an-val.a{border-color:#7e6333;background:#3b3019;color:#ffe09c;}
+.an-ml{font-size:9px;font-weight:650;opacity:.78;white-space:nowrap;}
+.an-empty-val{color:#53627e;font-size:12px;}
+.an-card-bottom{margin-top:auto;padding-top:10px;display:flex;align-items:center;justify-content:space-between;gap:9px;border-top:1px solid #24283b;color:#8fa1c2;font-size:10px;}
+.an-card-bottom a{color:#9fbaff;text-decoration:none;white-space:nowrap;}.an-card-bottom a:hover{text-decoration:underline;}
+.an-source-tag{font-weight:600;color:#8ea3c8;}
+.an-expand{margin:5px 0 11px;font-size:11px;color:#becbec;}
+.an-expand summary{cursor:pointer;list-style:none;text-align:center;color:#abcaff;padding:7px 2px;}
+.an-expand summary:hover{color:#f4f8ff;}
+.an-expand summary::-webkit-details-marker{display:none;}
+.an-expand[open] summary{border-bottom:1px solid #273046;margin-bottom:7px;}
+.an-expand .an-table{margin-top:0;}
+.an-expand .an-table td{border-bottom:1px solid #202737;}
+.an-footnote {font-size:11px;color:#8495b4;line-height:1.65;margin:13px 0;}
+.an-blank {color:#9bb0cd;text-align:center;border:1px dashed #363c53;padding:24px;border-radius:12px;}
+.an-status-line{font-size:11px;color:#9eb0d0;}
+@media(max-width:1150px){.an-card{padding:13px 11px 10px;}.an-val{min-width:43px;font-size:11px}.an-table th:first-child{width:43%;}.an-icon{width:38px;height:38px;flex-basis:38px;font-size:20px}.an-card-title{font-size:12px}}
+@media(max-width:790px){.block-container{padding:1rem .8rem 2rem;}.an-nav-left{gap:12px}.an-nav-item{display:none}.an-card{padding:14px}.an-card-title{font-size:14px}.an-sources{grid-template-columns:1fr;gap:9px}.an-source{min-height:85px;padding:13px}}
 </style>
 """
-st.markdown(STYLE,unsafe_allow_html=True)
-st.markdown('<div class="an-brand"><div class="an-logo"><span>▰</span> ACTION NETWORK <span style="font-size:11px;color:#98ABC5;font-weight:500">/ ODDS STUDIO</span></div><div class="an-pilot">INTERNAL RESEARCH PROTOTYPE</div></div>',unsafe_allow_html=True)
-st.markdown('<div class="an-topline">PREDICTION-MARKET INTELLIGENCE</div><div class="an-title">Markets Dashboard</div><div class="an-subtitle">Live probabilities from Kalshi and Polymarket, compared with Action Network’s provisional fair-odds model.</div>',unsafe_allow_html=True)
+st.markdown(CSS, unsafe_allow_html=True)
+
+BASE = Path(__file__).parent
+HISTORY = BASE / "history.csv"
+ALIASES = BASE / "market_aliases.csv"
 
 with st.sidebar:
-    st.markdown('### Data and model settings')
-    pages = st.select_slider('API pages per platform',options=[1,2,3,5,10,20,40,80,160],value=5,
-             help='More pages increase market coverage but slow loading and can hit API limits. Each platform paginates independently.')
-    st.caption('Kalshi fetches up to 200 events/page; Polymarket up to 100 events/page.')
-    st.markdown('**Model**')
-    history_file = Path(__file__).parent/'history.csv'
-    st.caption('Training start: March 1, 2025. Recency half-life: 18 months. Historical estimates activate only when verified settled-event records are present.')
-    st.markdown('**Development status**')
-    st.caption('Indicative exchange probabilities, not executable prices. Automated matching is conservative; confirm settlement criteria before publishing.')
-    with st.expander('Source API links'):
-        st.link_button('Kalshi public API', 'https://docs.kalshi.com/api-reference/events/get-events')
-        st.link_button('Polymarket Gamma API', 'https://docs.polymarket.com/')
+    st.subheader("Data settings")
+    pages = st.select_slider(
+        "API pages per platform", options=[1, 2, 3, 5, 10, 20, 40, 80], value=5,
+        help="Higher page caps scan more active events, but slow initial loading and may hit rate limits.",
+    )
+    st.caption("Kalshi: up to 200 events/page. Polymarket: 100 events/page. Results are a partial scan unless pagination completes.")
+    st.divider()
+    st.markdown("**Research model**")
+    st.caption("Historical period starts March 1, 2025. 18-month decay half-life. No validated category weights until sufficient actual settled outcomes are imported.")
+    st.caption("Archived markets are **not** shown on the live dashboard. They belong in history.csv for calibration.")
+    st.divider()
+    st.markdown("**Official documentation**")
+    st.link_button("Kalshi API", "https://docs.kalshi.com/api-reference/events/get-events")
+    st.link_button("Polymarket Gamma", "https://docs.polymarket.com/")
 
-@st.cache_data(ttl=120,show_spinner=False)
-def load_live(page_cap):
-    # Isolate failures: a single unavailable exchange does not hide the other.
-    quotes = {"Kalshi":[],"Polymarket":[]}
-    meta = {}
+@st.cache_data(ttl=120, show_spinner=False)
+def load_live(page_cap: int):
+    """Read-only, OPEN/ACTIVE markets. No settled listings are requested."""
+    quotes = {"Kalshi": [], "Polymarket": []}
+    diagnostics = {}
     errors = {}
-    for source, fn in (("Kalshi",fetch_kalshi),("Polymarket",fetch_polymarket)):
+    for platform, fn in (("Kalshi", fetch_kalshi), ("Polymarket", fetch_polymarket)):
         try:
-            quotes[source],meta[source] = fn(page_cap)
-        except FeedError as e:
-            errors[source]=str(e)
-            meta[source]={"events_scanned":0,"complete":False}
-    return quotes, meta, errors, datetime.now(timezone.utc).isoformat()
+            quotes[platform], diagnostics[platform] = fn(page_cap)
+        except Exception as ex:
+            errors[platform] = str(ex)[:250]
+            diagnostics[platform] = {"events_scanned": 0, "complete": False}
+    return quotes, diagnostics, errors, datetime.now(timezone.utc).isoformat()
 
-left_feed,right_feed = st.columns(2)
-with left_feed:
-    st.markdown('<div class="an-feed"><div class="an-feed-name" style="color:#45DD9C">● Kalshi</div><div class="an-feed-sub">Open event contracts · Read-only probability feed</div></div>',unsafe_allow_html=True)
-with right_feed:
-    st.markdown('<div class="an-feed"><div class="an-feed-name" style="color:#479CFF">◈ Polymarket</div><div class="an-feed-sub">Active prediction markets · Read-only probability feed</div></div>',unsafe_allow_html=True)
+st.markdown('''<div class="an-nav"><div class="an-nav-left"><div class="an-logo"><span class="an-logo-mark">A</span> ACTION NETWORK <span style="color:#8d9fbe;font-size:12px;font-weight:600">/ ODDS STUDIO</span></div><span class="an-nav-item active">Markets</span><span class="an-nav-item">Live intelligence</span></div><span class="an-nav-tag">INTERNAL PROTOTYPE</span></div>''', unsafe_allow_html=True)
+st.markdown('''<div class="an-head"><div class="an-title">Markets Dashboard</div><div class="an-subtitle">Browse active Kalshi and Polymarket markets side by side, with Action Network fair-odds estimates where outcomes can be matched.</div></div>''', unsafe_allow_html=True)
 
-refresh_col,stamp_col = st.columns([1,5],vertical_alignment='center')
-with refresh_col:
-    if st.button('↻ Refresh live data',use_container_width=True):
-        load_live.clear()
-        st.rerun()
-with stamp_col:
-    st.caption('Live API snapshot · 2-minute cache · Manual refresh available')
+with st.spinner("Retrieving active exchange markets…"):
+    live, diagnostics, errors, refreshed = load_live(pages)
 
-with st.spinner('Loading markets from public APIs…'):
-    live,meta,errors,fetched_at = load_live(pages)
-st.caption(f'Last successful fetch attempt: {datetime.fromisoformat(fetched_at):%d %b %Y, %H:%M:%S} UTC')
-for key,error in errors.items():
-    st.error(f'{key} feed unavailable: {error}. This is an API issue, not a missing market match.')
-if not live['Polymarket']:
-    st.error('**No Polymarket prices were retrieved.** The dashboard cannot calculate AN blends. Check the Polymarket feed error above and the source diagnostics below.')
-elif not live['Kalshi']:
-    st.warning('Kalshi quotes are unavailable; showing Polymarket-only markets.')
-if not live['Kalshi'] and not live['Polymarket']:
-    st.error('No live data could be retrieved. This app requires a deployed server with outbound access to the official exchange APIs. No example predictions have been substituted.')
-    st.stop()
+source_cards = []
+for src, cls in (("Kalshi", "an-kname"), ("Polymarket", "an-pname")):
+    n = len(live[src])
+    scan = diagnostics[src]
+    indicator = "FULL SCAN" if scan.get("complete") else "PARTIAL SCAN"
+    source_cards.append(f'''<div class="an-source"><div class="an-source-row"><span class="an-source-name {cls}">{src}</span><span class="an-source-count">{n:,} quotes</span></div><div class="an-source-caption">Active markets · {indicator} · {scan.get('events_scanned', 0):,} events scanned</div></div>''')
+st.markdown('<div class="an-sources">' + ''.join(source_cards) + '</div>', unsafe_allow_html=True)
+st.markdown('<div class="an-rule"></div>', unsafe_allow_html=True)
 
 aliases = {}
-alias_file=Path(__file__).parent/'market_aliases.csv'
-if alias_file.exists():
-    with alias_file.open(encoding='utf-8',newline='') as f:
-        for r in csv.DictReader(f):
-            if r.get('kalshi_event_id') and r.get('polymarket_event_id'):
-                aliases[r['kalshi_event_id']]=r['polymarket_event_id']
+if ALIASES.exists():
+    with ALIASES.open(newline="", encoding="utf-8") as f:
+        for record in csv.DictReader(f):
+            k = record.get("kalshi_event_id", "").strip()
+            p = record.get("polymarket_event_id", "").strip()
+            if k and p:
+                aliases[k] = p
 
-cards = combine_quotes(live['Kalshi'],live['Polymarket'],aliases)
-model = AccuracyModel(read_history(history_file))
-matched = sum(1 for c in cards if c.matched)
+cards = combine_quotes(live["Kalshi"], live["Polymarket"], aliases)
+model = AccuracyModel(read_history(HISTORY))
+matched_total = sum(1 for c in cards if c.matched)
 
-# Prominent diagnostics: a working feed is not the same thing as a successful match.
-with st.expander('Live source diagnostics and matching — check here if a column is empty',expanded=not bool(live['Polymarket'])):
-    for exchange in ('Kalshi','Polymarket'):
-        source_meta=meta[exchange]
-        st.write(f"**{exchange}:** {len(live[exchange]):,} usable outcome quotes · "
-                 f"{source_meta.get('events_scanned',0):,} scanned · "
-                 f"endpoint {source_meta.get('endpoint','/events')} · "
-                 f"{source_meta.get('contracts_skipped',0):,} skipped · "
-                 f"{'complete' if source_meta.get('complete') else 'partial'} scan")
-    st.write(f"**Matched events:** {matched:,}. When title, candidate name, cutoff date or settlement rules differ, we leave the opposite column blank rather than guess.")
-    st.write('**Troubleshooting:** Choose **Polymarket markets** in Coverage to confirm that it works independently of Kalshi. Increase API pages for broader discovery. Use **Matched pairs** to see only legitimate side-by-side comparisons.')
+if errors:
+    for name, error in errors.items():
+        st.error(f"{name} live feed problem: {error}")
+if not live["Kalshi"] and not live["Polymarket"]:
+    st.warning("No active quotes could be loaded. Check the API connections and diagnostics below.")
 
-mc = st.columns(4)
-for col,title,value in zip(mc,['Events displayed','Cross-platform matched','Kalshi contract quotes','Polymarket contract quotes'],
-                           [f'{len(cards):,}',f'{matched:,}',f"{len(live['Kalshi']):,}",f"{len(live['Polymarket']):,}"]):
-    with col: st.metric(title,value)
+# All primary controls are on one neat toolbar, as in the reference dashboard.
+t_search, t_source, t_layout, t_refresh = st.columns([4.6, 2.8, 1.5, .65], vertical_alignment="center", gap="small")
+with t_search:
+    search = st.text_input("Search markets", placeholder="⌕  Search markets or outcomes", key="market_search", label_visibility="collapsed")
+with t_source:
+    source_view = st.segmented_control("Source", ["All", "Kalshi", "Polymarket", "Matched"], default="All", key="source_view", label_visibility="collapsed")
+with t_layout:
+    layout = st.segmented_control("Layout", ["Grid", "Table"], default="Grid", key="market_layout", label_visibility="collapsed")
+with t_refresh:
+    if st.button("↻", help="Refresh the live feeds (2-minute cache)", use_container_width=True):
+        load_live.clear()
+        st.rerun()
 
-notes = []
-for exchange in ('Kalshi','Polymarket'):
-    if not meta[exchange]['complete']:
-        notes.append(f"{exchange} scan limited to {meta[exchange]['events_scanned']:,} events")
-if notes:
-    st.info('Partial coverage: '+' · '.join(notes)+'. Increase API pages in the sidebar to scan more. Market counts are NOT total exchange listings.')
-if not model.rows:
-    st.warning('**AN model: provisional 50/50 baseline.** No real historical results are loaded yet. We do not claim this estimate is independently validated. See README for the historical backfill workflow.')
-else:
-    st.info(f'Historical calibration engine: {len(model.rows):,} imported settled observations. Individual categories activate only after minimum sample thresholds. Out-of-sample validation is still required before external publication.')
+cat_col, count_col = st.columns([5.8, 1], vertical_alignment="center", gap="small")
+with cat_col:
+    chosen = st.pills(
+        "Category", ["All markets", "Sports", "Entertainment", "Politics", "Crypto", "Economics", "Science & Tech", "Weather", "Other"],
+        default="All markets", key="category_choice", label_visibility="collapsed",
+    )
+with count_col:
+    st.markdown(f'<div class="an-results" style="text-align:right">{len(cards):,} indexed events</div>', unsafe_allow_html=True)
 
-st.markdown('<div class="an-divider"></div>',unsafe_allow_html=True)
-filter_col, category_col, source_col, format_col = st.columns([3.1,2.1,1.4,1.15],vertical_alignment='bottom')
-with filter_col: search = st.text_input('Search markets',placeholder='Search events, outcomes, teams...',label_visibility='visible')
-with category_col: chosen = st.selectbox('Category',['All categories',*CATEGORY_NAMES])
-with source_col: source_view = st.selectbox('Coverage',['All markets (mixed)','Matched pairs','Kalshi markets','Polymarket markets','Kalshi only','Polymarket only'])
-with format_col: layout = st.radio('Layout',['Grid','Table'],horizontal=True)
+search_normalized = (search or "").strip().lower()
+filtered = []
+for card in cards:
+    if chosen and chosen != "All markets" and card.category != chosen:
+        continue
+    if search_normalized and search_normalized not in (card.title + " " + " ".join(r.label for r in card.rows)).lower():
+        continue
+    has_k = any(r.kalshi is not None for r in card.rows)
+    has_p = any(r.polymarket is not None for r in card.rows)
+    if source_view == "Kalshi" and not has_k:
+        continue
+    if source_view == "Polymarket" and not has_p:
+        continue
+    if source_view == "Matched" and not card.matched:
+        continue
+    filtered.append(card)
 
-filtered=[]
-for c in cards:
-    if chosen != 'All categories' and c.category != chosen: continue
-    if search and search.lower() not in (c.title+' '+' '.join(r.label for r in c.rows)).lower(): continue
-    k_count=sum(x.kalshi is not None for x in c.rows)
-    p_count=sum(x.polymarket is not None for x in c.rows)
-    if source_view == 'Matched pairs' and not c.matched: continue
-    if source_view == 'Kalshi markets' and not k_count: continue
-    if source_view == 'Polymarket markets' and not p_count: continue
-    if source_view == 'Kalshi only' and (not k_count or p_count): continue
-    if source_view == 'Polymarket only' and (not p_count or k_count): continue
-    filtered.append(c)
+scan_complete = all(diagnostics[name].get("complete") for name in ("Kalshi", "Polymarket"))
+coverage_label = "full pagination" if scan_complete else "partial API coverage"
+st.markdown(
+    f'<div class="an-mini-info">Showing <b>{len(filtered):,}</b> active events from this snapshot · '
+    f'<b>{matched_total:,}</b> potentially matched event pairs · {coverage_label} · '
+    f'Updated {datetime.fromisoformat(refreshed):%H:%M UTC}</div>',
+    unsafe_allow_html=True,
+)
 
-st.caption(f'{len(filtered):,} events match filters · {sum(c.matched for c in filtered):,} matched events · All markets view alternates single-source Kalshi and Polymarket events; a blank opposite column means no verified match')
-
-if 'last_filter' not in st.session_state:st.session_state.last_filter=None
-filter_token=(search,chosen,source_view,layout,pages)
-if st.session_state.last_filter!=filter_token:
-    st.session_state.last_filter=filter_token
-    st.session_state.page_num=1
-
-per_page=st.selectbox('Events per page',[12,24,48,96],index=1)
-page_count=max(1,(len(filtered)+per_page-1)//per_page)
-if st.session_state.get('page_num',1)>page_count:st.session_state.page_num=1
-page_num=st.number_input('Page',min_value=1,max_value=page_count,step=1,key='page_num')
-visible=filtered[(page_num-1)*per_page:page_num*per_page]
+CATEGORY_ICONS = {
+    "Sports": "🏅", "Politics": "🏛️", "Entertainment": "🎬", "Crypto": "₿",
+    "Economics": "📈", "Science & Tech": "🔬", "Weather": "⛅", "Other": "✦",
+}
 
 
-def format_volume(v):
-    if v>=1e9:return f'{v/1e9:.1f}B'
-    if v>=1e6:return f'{v/1e6:.1f}M'
-    if v>=1e3:return f'{v/1e3:.1f}K'
-    return f'{v:,.0f}'
+def display_probability(prob: float) -> str:
+    """Readable at both large and tiny probabilities."""
+    percent = prob * 100
+    if percent > 99.9:
+        return ">99.9%"
+    if 0 < percent < .1:
+        return "<0.1%"
+    if percent < 1:
+        return f"{percent:.1f}%"
+    return f"{percent:.0f}%" if percent >= 10 else f"{percent:.1f}%"
 
 
-def quote_html(q, cls):
-    if not q:return '<span style="color:#7889A4">—</span>'
-    return f'<span class="an-cell {cls}">{q.probability*100:.1f}%<span class="an-odd">{escape(american(q.probability))}</span></span>'
+def quote_cell(quote, marker: str):
+    if quote is None:
+        return '<span class="an-empty-val">—</span>'
+    p = quote.probability
+    return f'<span class="an-val {marker}">{escape(display_probability(p))}<span class="an-ml">{escape(american(p))}</span></span>'
 
 
-def model_html(k,p):
-    res=model.predict(k,p)
-    if res['probability'] is None:return '<span style="color:#7889A4">—</span>',res
-    pr=res['probability']
-    return f'<span class="an-cell an-model">{pr*100:.1f}%<span class="an-odd">{escape(american(pr))}</span></span>',res
+def model_cell(kalshi, polymarket):
+    prediction = model.predict(kalshi, polymarket)
+    if prediction["probability"] is None:
+        return '<span class="an-empty-val">—</span>'
+    p = prediction["probability"]
+    return f'<span class="an-val a" title="{escape(prediction["status"], quote=True)}">{escape(display_probability(p))}<span class="an-ml">{escape(american(p))}</span></span>'
 
 
-def render_card(c):
-    rows_html=[]
-    statuses=set()
-    for r in c.rows[:6]:
-        an,res=model_html(r.kalshi,r.polymarket)
-        statuses.add(res['status'])
-        label=escape(r.label[:90])
-        rows_html.append(f'<tr><td title="{label}">{label}</td><td>{quote_html(r.kalshi,"an-kalshi")}</td><td>{quote_html(r.polymarket,"an-poly")}</td><td>{an}</td></tr>')
-    more=f'<div class="an-note">+{len(c.rows)-6} more outcomes — switch to Table view for the full list</div>' if len(c.rows)>6 else ''
-    status='Matched · review contract rules' if c.matched else 'One source only'
-    tag='an-match' if c.matched else 'an-onesource'
-    urls={}
-    for r in c.rows:
-        for q in (r.kalshi,r.polymarket):
-            if q:urls[q.exchange]=q.url
-    linkstr=' · '.join(f'<a href="{escape(u,quote=True)}" target="_blank" rel="noopener noreferrer">{escape(name)} ↗</a>' for name,u in urls.items())
-    source_vol = {}
-    for name in ('Kalshi','Polymarket'):
-        unique_q = {q.market_id:q for r in c.rows for q in (r.kalshi,r.polymarket) if q and q.exchange == name}
-        if unique_q:
-            suffix = ' contracts' if name == 'Kalshi' else ' USD vol.'
-            amount = format_volume(sum(q.volume for q in unique_q.values()))
-            source_vol[name] = name + ': ' + ('$' if name == 'Polymarket' else '') + amount + suffix
-    volumes = escape(' · '.join(source_vol.values()))
-    return f'''<div class="an-card"><div class="an-card-head"><div><div class="an-card-title">{escape(c.title)}</div><div class="an-cat">{escape(c.category)}</div></div><div class="{tag}">{status}</div></div>
-    <table class="an-matrix"><thead><tr><th>OUTCOME</th><th style="color:#45DD9C">KALSHI</th><th style="color:#76ACFF">POLY</th><th style="color:#F5D688">AN MODEL</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table>{more}
-    <div class="an-card-foot"><span>{volumes}</span><span>{linkstr}</span></div></div>'''
+def compact_volume(value: float) -> str:
+    if value >= 1e9:
+        return f"{value / 1e9:.1f}B"
+    if value >= 1e6:
+        return f"{value / 1e6:.1f}M"
+    if value >= 1e3:
+        return f"{value / 1e3:.1f}K"
+    return f"{value:,.0f}"
+
+
+def rows_markup(rows):
+    return "".join(
+        '<tr>'
+        + f'<td>{escape(r.label)}</td>'
+        + f'<td>{quote_cell(r.kalshi, "k")}</td>'
+        + f'<td>{quote_cell(r.polymarket, "p")}</td>'
+        + f'<td>{model_cell(r.kalshi, r.polymarket)}</td>'
+        + '</tr>' for r in rows
+    )
+
+
+def card_markup(card):
+    sorted_rows = sorted(card.rows, key=lambda r: max(
+        r.kalshi.probability if r.kalshi else 0,
+        r.polymarket.probability if r.polymarket else 0,
+    ), reverse=True)
+    top = sorted_rows[:2]
+    rest = sorted_rows[2:]
+    icon = CATEGORY_ICONS.get(card.category, "✦")
+    dates = [date_from_string(q.close_at) for r in card.rows for q in (r.kalshi, r.polymarket) if q and q.close_at]
+    dates = [d for d in dates if d]
+    close_label = min(dates).strftime("%b %-d, %Y") if dates else "Date unlisted"
+    status = '<span class="an-match-chip" title="Automated match; confirm the settlement rules">MATCHED*</span>' if card.matched else ""
+    heading = f'''<div class="an-card-head"><span class="an-icon">{icon}</span><div class="an-heading"><div class="an-card-title">{escape(card.title)}</div><div class="an-meta">{escape(close_label)} · {escape(card.category)} {status}</div></div></div>'''
+    tablehead = '<thead><tr><th>OUTCOME</th><th class="an-kalshi-col">KALSHI</th><th class="an-poly-col">POLY</th><th class="an-an-col">AN MODEL</th></tr></thead>'
+    main_table = f'<table class="an-table">{tablehead}<tbody>{rows_markup(top)}</tbody></table>'
+    expanded = (
+        f'<details class="an-expand"><summary>Show all {len(sorted_rows)} outcomes ▾</summary>'
+        f'<table class="an-table"><tbody>{rows_markup(rest)}</tbody></table></details>'
+        if rest else '<div style="height:9px"></div>'
+    )
+    kalshi = {q.market_id: q for r in card.rows for q in (r.kalshi,) if q}
+    poly = {q.market_id: q for r in card.rows for q in (r.polymarket,) if q}
+    source_info = []
+    if kalshi:
+        source_info.append("K " + compact_volume(sum(q.volume for q in kalshi.values())) + " contracts")
+    if poly:
+        source_info.append("P $" + compact_volume(sum(q.volume for q in poly.values())) + " vol")
+    source_links = []
+    for source, group in (("Kalshi", kalshi), ("Polymarket", poly)):
+        if group:
+            first = next(iter(group.values()))
+            source_links.append(f'<a href="{escape(first.url, quote=True)}" target="_blank" rel="noopener noreferrer">{source} ↗</a>')
+    foot = '<div class="an-card-bottom"><span class="an-source-tag">' + escape(" · ".join(source_info)) + '</span><span>' + " · ".join(source_links) + '</span></div>'
+    return f'<div class="an-card">{heading}{main_table}{expanded}{foot}</div>'
+
+
+# Pagination follows the cards, not above them.
+PAGE_SIZE = 18
+filter_key = (search_normalized, chosen, source_view, layout, pages)
+if st.session_state.get("last_filter") != filter_key:
+    st.session_state["last_filter"] = filter_key
+    st.session_state["page"] = 1
+max_page = max(1, math.ceil(len(filtered) / PAGE_SIZE))
+st.session_state["page"] = min(st.session_state.get("page", 1), max_page)
+current_page = st.session_state["page"]
+visible = filtered[(current_page - 1) * PAGE_SIZE : current_page * PAGE_SIZE]
 
 if not visible:
-    st.markdown('<div class="an-empty">No markets found for the selected filters.</div>',unsafe_allow_html=True)
-elif layout=='Grid':
-    for i in range(0,len(visible),3):
-        cols=st.columns(3,gap='medium')
-        for col,c in zip(cols,visible[i:i+3]):
-            with col:st.markdown(render_card(c),unsafe_allow_html=True)
+    st.markdown('<div class="an-blank">No active markets match the selected filters. Try a different category or source.</div>', unsafe_allow_html=True)
+elif layout == "Grid":
+    for i in range(0, len(visible), 3):
+        cols = st.columns(3, gap="medium")
+        for col, card in zip(cols, visible[i:i + 3]):
+            with col:
+                st.markdown(card_markup(card), unsafe_allow_html=True)
 else:
-    table=[]
-    for c in visible:
-        for r in c.rows:
-            forecast=model.predict(r.kalshi,r.polymarket)
-            table.append({'Market':c.title,'Category':c.category,'Outcome':r.label,
-                          'Kalshi %':round(100*r.kalshi.probability,2) if r.kalshi else None,
-                          'Polymarket %':round(100*r.polymarket.probability,2) if r.polymarket else None,
-                          'AN model %':round(100*forecast['probability'],2) if forecast['probability'] is not None else None,
-                          'AN fair moneyline':american(forecast['probability']),
-                          'AN model status':forecast['status']})
-    st.dataframe(pd.DataFrame(table),hide_index=True,use_container_width=True,height=min(850,90+34*len(table)))
+    table_rows = []
+    for card in visible:
+        for r in card.rows:
+            prediction = model.predict(r.kalshi, r.polymarket)
+            table_rows.append({
+                "Market": card.title,
+                "Category": card.category,
+                "Outcome": r.label,
+                "Kalshi %": round(100 * r.kalshi.probability, 2) if r.kalshi else None,
+                "Polymarket %": round(100 * r.polymarket.probability, 2) if r.polymarket else None,
+                "AN model %": round(100 * prediction["probability"], 2) if prediction["probability"] is not None else None,
+                "AN fair moneyline": american(prediction["probability"]),
+                "Model status": prediction["status"],
+            })
+    st.dataframe(pd.DataFrame(table_rows), hide_index=True, use_container_width=True, height=650)
 
-# Export full filtered results, not just the currently visible page.
-export_rows=[]
-for c in filtered:
-    for r in c.rows:
-        pred=model.predict(r.kalshi,r.polymarket)
-        export_rows.append({'event':c.title,'category':c.category,'outcome':r.label,
-           'kalshi_probability':r.kalshi.probability if r.kalshi else '',
-           'polymarket_probability':r.polymarket.probability if r.polymarket else '',
-           'an_probability':pred['probability'] if pred['probability'] is not None else '',
-           'an_fair_american_moneyline':american(pred['probability']),
-           'an_model_status':pred['status'], 'matched':c.matched,
-           'kalshi_url':r.kalshi.url if r.kalshi else '',
-           'polymarket_url':r.polymarket.url if r.polymarket else ''})
-buf=io.StringIO()
-if export_rows:
-    w=csv.DictWriter(buf,fieldnames=list(export_rows[0]))
-    w.writeheader();w.writerows(export_rows)
-st.download_button('↓ Export filtered markets (CSV)',data=buf.getvalue(),file_name='AN_Odds_Studio_Live_Markets.csv',mime='text/csv',disabled=not export_rows)
+prev_col, pager_col, next_col = st.columns([1, 5, 1], vertical_alignment="center")
+with prev_col:
+    if st.button("← Previous", disabled=current_page <= 1, use_container_width=True):
+        st.session_state["page"] -= 1
+        st.rerun()
+with pager_col:
+    st.markdown(f'<div class="an-results" style="text-align:center">Page {current_page:,} of {max_page:,} · {len(filtered):,} filtered events</div>', unsafe_allow_html=True)
+with next_col:
+    if st.button("Next →", disabled=current_page >= max_page, use_container_width=True):
+        st.session_state["page"] += 1
+        st.rerun()
 
-with st.expander('Methodology, model training and critical limitations'):
-    st.markdown('''
-**Source columns:** exchange-implied YES or named-outcome prices (Kalshi bid/ask midpoint when available; Polymarket latest Gamma outcome prices). These are indicative and may differ from executable bid/ask prices.
+# Full export of the indexed and filtered ACTIVE markets, not just the current page.
+export_rows = []
+for card in filtered:
+    for r in card.rows:
+        pred = model.predict(r.kalshi, r.polymarket)
+        export_rows.append({
+            "market": card.title, "category": card.category, "outcome": r.label,
+            "kalshi_probability": r.kalshi.probability if r.kalshi else "",
+            "polymarket_probability": r.polymarket.probability if r.polymarket else "",
+            "an_probability": pred["probability"] if pred["probability"] is not None else "",
+            "an_moneyline": american(pred["probability"]),
+            "an_status": pred["status"],
+            "matched": card.matched,
+            "kalshi_url": r.kalshi.url if r.kalshi else "",
+            "polymarket_url": r.polymarket.url if r.polymarket else "",
+        })
+buf = io.StringIO()
+writer = csv.DictWriter(buf, fieldnames=list(export_rows[0]) if export_rows else ["market"])
+writer.writeheader()
+writer.writerows(export_rows)
 
-**AN column:** displayed **only when an outcome is confidently matched across BOTH platforms**. With no verified historical dataset, the provisional estimate is a transparent 50/50 mean; when sufficient imported historical observations exist, an 18-month half-life discounts older records, locally calibrates each platform and adjusts blending weights **only from matched, resolved historical events**. Minimum sample safeguards prevent unreliable category claims.
+st.markdown('<div class="an-rule"></div>', unsafe_allow_html=True)
+download_col, note_col = st.columns([1.5, 4.5], vertical_alignment="center")
+with download_col:
+    st.download_button(
+        "↓ Export filtered active markets",
+        data=buf.getvalue(), file_name="AN_Odds_Studio_Active_Markets.csv",
+        mime="text/csv", disabled=not export_rows,
+        use_container_width=True,
+    )
+with note_col:
+    status_msg = (
+        f"Experimental historical data loaded ({len(model.rows):,} observations), but requires independent backtesting."
+        if model.rows else "AN Model currently uses an **unvalidated 50/50 baseline** on matched events. Historical training has not been completed."
+    )
+    st.caption(status_msg)
 
-**History:** observations must be dated from **March 1, 2025** and include an actual 0/1 settlement result and an actual pre-settlement probability. No historical performance is fabricated. A five-year/24-month decision can be tested later via time-ordered backtesting.
+with st.expander("Data diagnostics and research methodology"):
+    st.markdown("**Live data coverage**")
+    for source in ("Kalshi", "Polymarket"):
+        d = diagnostics[source]
+        st.write(
+            f"- **{source}:** {len(live[source]):,} usable quotes from {d.get('events_scanned', 0):,} "
+            f"events; {'complete' if d.get('complete') else 'partial'} scan. "
+            f"Endpoint {d.get('endpoint', '/events')}."
+        )
+    st.write(f"Potentially matched event pairs: **{matched_total:,}**. Matching is conservative and not a verification of identical settlement terms.")
+    st.markdown("**Live vs. historical markets**")
+    st.markdown(
+        "- **Main dashboard:** only open/active market API listings, refreshed on a 120-second cache. "
+        "No intentionally closed or settled markets are fetched.\n"
+        "- **Historical calibration:** the separate `history.csv` is populated by a dedicated backfill script or a verified dataset. "
+        "It contains resolved outcomes and pre-resolution snapshots dated March 2025 onward. "
+        "Those historical rows are never mixed into the public-facing market cards.\n"
+        "- **AN probability:** an experimental 50/50 benchmark until sufficient verified matched histories exist. "
+        "Moneylines are fair-odds conversions, not tradable sportsbook prices."
+    )
+    st.markdown(
+        "**Important:** market counts reflect API page caps, not all listings on the exchanges. "
+        "A missing opposite-exchange quote means there is no sufficiently reliable match in the scanned data. "
+        "Kalshi contract volumes and Polymarket dollar volumes must not be combined or treated as equivalent. "
+        "Check actual market rules, fees and settlement criteria before publication."
+    )
 
-**Matching:** cross-platform contracts may differ in timing, outcome definition, fees, void rules and settlement policies. Matching uses conservative titles, outcome labels and dates; it **cannot guarantee** identical rules. Always verify source contracts.
-
-**Coverage:** The mixed dashboard alternates unmatched Kalshi and Polymarket events. Both feeds must return usable quotes before a blended AN estimate can be made. A missing opposite exchange quote is not a zero probability. API pagination determines what has been scanned. A partial scan must never be described as all active exchange markets. Some newly listed or thin markets do not have usable price fields.
-
-**Volume:** Kalshi volume counts contracts, while Polymarket volume is often USD-denominated. For that reason this interface's combined volume is **only a rough ranking heuristic**, not a meaningful pooled dollar volume. Do not cite combined totals externally.
-
-**Internal research prototype only.** AN fair American moneyline is a mathematical probability conversion without bookmaker margin, not an executable quote, investment advice or a validated forecast. The app does not place trades or access private accounts.
-''')
-st.markdown('<div class="an-note">*Source volumes use different units (Kalshi contracts vs. Polymarket USD). Cross-market sorting is approximate; volumes must not be added together. Data source attribution: Kalshi and Polymarket. Prototype is not affiliated with either exchange.</div>',unsafe_allow_html=True)
+st.markdown('<div class="an-footnote">Research prototype for internal evaluation. Data attribution: Kalshi and Polymarket. Market probabilities may be delayed or non-executable. No trading takes place through this dashboard.</div>', unsafe_allow_html=True)
