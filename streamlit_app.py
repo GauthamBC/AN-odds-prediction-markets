@@ -17,9 +17,12 @@ import streamlit as st
 
 from core import CATEGORY_NAMES, american, date_from_string
 from feeds import (FeedError, fetch_kalshi, fetch_polymarket, fetch_polymarket_us,
-                   fetch_polymarket_search, fetch_polymarket_slug, merge_quotes, KNOWN_GAMMA_SLUGS)
+                   fetch_polymarket_search, fetch_polymarket_slug, fetch_polymarket_us_search, merge_quotes, KNOWN_GAMMA_SLUGS)
 from matching import combine_quotes, canonical_event_key, event_volumes
 from model import AccuracyModel, read_history
+from mappings import (read_mappings, read_outcome_mappings, proposed_mapping_rows,
+                      proposed_outcome_rows, HEADERS, OUTCOME_HEADERS)
+from index_store import add_quotes, recent_quotes
 
 st.set_page_config(
     page_title="Markets Dashboard | AN Odds Studio",
@@ -117,6 +120,7 @@ st.markdown(CSS, unsafe_allow_html=True)
 BASE = Path(__file__).parent
 HISTORY = BASE / "history.csv"
 ALIASES = BASE / "market_aliases.csv"
+OUTCOME_ALIASES = BASE / "outcome_aliases.csv"
 
 with st.sidebar:
     st.subheader("Market coverage")
@@ -144,7 +148,7 @@ with st.sidebar:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def load_live(k_pages: int, p_pages: int, us_on: bool, u_pages: int, bbo_limit: int):
-    """Fetch open markets only; settle/historical markets are not requested."""
+    """Fetch open markets only; settled/historical markets are not requested."""
     quotes = {"Kalshi": [], "Polymarket": [], "Polymarket US": []}
     diagnostics = {}
     errors = {}
@@ -173,6 +177,7 @@ def targeted_discovery(kalshi_quotes, query, enabled=True):
     # A meaningful direct search must work even for an event absent from Kalshi's scan.
     if len(query.strip()) >= 5:
         tasks.append(('search', query.strip()[:130]))
+        tasks.append(('us_search', query.strip()[:130]))
     # Find frequently searched, long-duration political counterparts by stable slug.
     groups = {}
     for item in kalshi_quotes:
@@ -195,12 +200,17 @@ def targeted_discovery(kalshi_quotes, query, enabled=True):
         primary = [t for t in totals if token in t.lower()][:3] + primary
     for title in primary:
         tasks.append(('search', title[:130]))
-    tasks = list(dict.fromkeys(tasks))[:11]
+        if len([t for t in tasks if t[0]=='us_search'])<4:
+            tasks.append(('us_search', title[:130]))
+    tasks = list(dict.fromkeys(tasks))[:15]
     rows, info, errors = [], [], []
     def execute(task):
         mode, argument = task
         if mode == 'slug':
             return fetch_polymarket_slug(argument), mode + ':' + argument
+        if mode == 'us_search':
+            result, _ = fetch_polymarket_us_search(argument)
+            return result, mode + ':' + argument
         result, _ = fetch_polymarket_search(argument)
         return result, mode + ':' + argument
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -238,14 +248,9 @@ source_cards.append(
 st.markdown('<div class="an-sources">' + ''.join(source_cards) + '</div>', unsafe_allow_html=True)
 st.markdown('<div class="an-rule"></div>', unsafe_allow_html=True)
 
-aliases = {}
-if ALIASES.exists():
-    with ALIASES.open(newline="", encoding="utf-8") as f:
-        for record in csv.DictReader(f):
-            k = record.get("kalshi_event_id", "").strip()
-            p = record.get("polymarket_event_id", "").strip()
-            if k and p:
-                aliases[k] = p
+# Only manually verified mappings from a GitHub-backed CSV are trusted as overrides.
+aliases = read_mappings(ALIASES)
+outcome_aliases = read_outcome_mappings(OUTCOME_ALIASES)
 
 
 if errors:
@@ -267,12 +272,23 @@ with t_refresh:
         load_live.clear()
         st.rerun()
 
-# Search beyond the limited high-volume scan; preserve unique exchange venue IDs.
+# Search and index independently of the initial volume-ranked scan.
 extra_poly, discovery_info, discovery_errors = targeted_discovery(
     live["Kalshi"], search or "", auto_search
 )
-poly_all = merge_quotes(live["Polymarket"], live["Polymarket US"], extra_poly)
-cards = combine_quotes(live["Kalshi"], poly_all, aliases)
+store_note = ""
+try:
+    fresh = merge_quotes(*live.values(), extra_poly)
+    add_quotes(fresh)
+    # Only quotes fetched very recently are eligible; the index is ephemeral.
+    indexed = recent_quotes(ttl_seconds=300)
+    combined = merge_quotes(indexed, fresh)
+except Exception as exc:
+    store_note = f"Runtime quote index unavailable: {str(exc)[:160]}"
+    combined = merge_quotes(*live.values(), extra_poly)
+kalshi_all = [q for q in combined if q.exchange == "Kalshi"]
+poly_all = [q for q in combined if q.exchange in ("Polymarket", "Polymarket US")]
+cards = combine_quotes(kalshi_all, poly_all, aliases, outcome_aliases)
 model = AccuracyModel(read_history(HISTORY))
 matched_total = sum(1 for c in cards if c.matched)
 
@@ -379,7 +395,7 @@ def card_markup(card):
     dates = [date_from_string(q.close_at) for r in card.rows for q in (r.kalshi, r.polymarket) if q and q.close_at]
     dates = [d for d in dates if d]
     close_label = min(dates).strftime("%b %-d, %Y") if dates else "Date unlisted"
-    status = '<span class="an-match-chip" title="Automated candidate match; contract rules require manual verification">MATCHED*</span>' if card.matched else ""
+    status = ('<span class="an-match-chip" title="Both exchange contracts have a reviewed event mapping">EVENT VERIFIED</span>' if card.rule_reviewed else '<span class="an-match-chip" title="Automated candidate match; settlement-rule review pending">POSSIBLE MATCH*</span>') if card.matched else ''
     heading = f'''<div class="an-card-head"><span class="an-icon">{icon}</span><div class="an-heading"><div class="an-card-title">{escape(card.title)}</div><div class="an-meta">{escape(close_label)} · {escape(card.category)} {status}</div></div></div>'''
     tablehead = '<thead><tr><th>OUTCOME</th><th class="an-kalshi-col">KALSHI</th><th class="an-poly-col">POLY</th><th class="an-an-col">AN MODEL</th></tr></thead>'
     main_table = f'<table class="an-table">{tablehead}<tbody>{rows_markup(top)}</tbody></table>'
@@ -475,6 +491,22 @@ writer = csv.DictWriter(buf, fieldnames=list(export_rows[0]) if export_rows else
 writer.writeheader()
 writer.writerows(export_rows)
 
+# Candidate pairs never become verified automatically: export for editorial review.
+mapping_proposals=proposed_mapping_rows(cards)
+mapping_buf=io.StringIO()
+mapping_writer=csv.DictWriter(mapping_buf,fieldnames=HEADERS)
+mapping_writer.writeheader();mapping_writer.writerows(mapping_proposals)
+st.download_button("↓ Export pairs for rule review",data=mapping_buf.getvalue(),
+                   file_name="AN_Market_Mapping_Review.csv",mime="text/csv",
+                   disabled=not mapping_proposals)
+outcome_proposals=proposed_outcome_rows(cards)
+outcome_buf=io.StringIO()
+outcome_writer=csv.DictWriter(outcome_buf,fieldnames=OUTCOME_HEADERS)
+outcome_writer.writeheader();outcome_writer.writerows(outcome_proposals)
+st.download_button("↓ Export outcome pairs for review",data=outcome_buf.getvalue(),
+                   file_name="AN_Outcome_Mapping_Review.csv",mime="text/csv",
+                   disabled=not outcome_proposals)
+
 st.markdown('<div class="an-rule"></div>', unsafe_allow_html=True)
 download_col, note_col = st.columns([1.5, 4.5], vertical_alignment="center")
 with download_col:
@@ -487,12 +519,14 @@ with download_col:
 with note_col:
     status_msg = (
         f"Experimental historical data loaded ({len(model.rows):,} observations), but requires independent backtesting."
-        if model.rows else "AN Model currently uses an **unvalidated 50/50 baseline** on matched events. Historical training has not been completed."
+        if model.rows else "AN Model currently uses an **unvalidated 50/50 baseline** on candidate matches. Rule review and historical training are still required."
     )
     st.caption(status_msg)
 
 with st.expander("Data diagnostics and research methodology"):
     st.markdown("**Live data coverage**")
+    if store_note: st.caption(store_note)
+    st.caption("Local SQLite index retains very recent public quotes across app refreshes, but is temporary on Streamlit Cloud. Repository CSV holds the durable approved mappings.")
     for source in diagnostics:
         d = diagnostics[source]
         st.write(
@@ -500,7 +534,7 @@ with st.expander("Data diagnostics and research methodology"):
             f"events; {'complete' if d.get('complete') else 'partial'} scan. "
             f"Endpoint {d.get('endpoint', '/events')}."
         )
-    st.write(f"Potentially matched event pairs: **{matched_total:,}**. These are candidate matches; settlement criteria still need verification.")
+    st.write(f"Potentially matched event pairs: **{matched_total:,}**; reviewed mappings: **{sum(c.rule_reviewed for c in cards):,}**. Other matches require settlement-rule verification.")
     st.markdown("**Targeted Polymarket discovery (beyond paginated scans)**")
     if discovery_info:
         for item in discovery_info:
@@ -513,8 +547,8 @@ with st.expander("Data diagnostics and research methodology"):
     st.caption("Polymarket US and International are separate exchanges with different market lists and histories. Our calibration does not transfer accuracy estimates between the two.")
     st.markdown("**Live vs. historical markets**")
     st.markdown(
-        "- **Main dashboard:** only open/active market API listings, refreshed on a 120-second cache. "
-        "No intentionally closed or settled markets are fetched.\n"
+        "- **Main dashboard:** active market API listings, refreshed on a 120-second cache plus a maximum five-minute local quote index. "
+        "Closed/settled listings are filtered out, but an exchange can change status between snapshots.\n"
         "- **Historical calibration:** the separate `history.csv` is populated by a dedicated backfill script or a verified dataset. "
         "It contains resolved outcomes and pre-resolution snapshots dated March 2025 onward. "
         "Those historical rows are never mixed into the public-facing market cards.\n"

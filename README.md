@@ -1,76 +1,120 @@
-# AN Odds Studio — Streamlit prototype v1.4
+# Action Network Odds Studio — v1.5 (internal Streamlit research prototype)
 
-An **internal research prototype** for Action Network, showing active prediction-market quotes from **Kalshi**, **Polymarket International** and optionally **Polymarket US**. It attempts conservative cross-venue matching, shows probabilities and their **fair American-moneyline equivalents**, and offers an experimental AN model column.
+**Status: experimental and read-only.** The dashboard compares **active** markets
+from Kalshi, Polymarket International and Polymarket US (separate venues), then
+shows a provisional AN probability and fair American moneyline **only when a
+candidate event and outcome can be matched**. The baseline is **50/50**, not a
+historically validated forecast. Do not present it as independent fair value.
 
-> **Important:** The AN model is **NOT independently validated**. With an empty historical CSV it produces a *provisional 50/50 benchmark only* for matched contracts. The numbers are indicative probabilities, **not tradable sportsbook odds**. Do not present the dashboard as Action Network's validated proprietary pricing engine.
+The appearance is inspired by a compact three-column market dashboard. This
+code does not use PredictionPro's private backend, CSS or proprietary matching
+data. All live market inputs come from public exchange data services.
 
-## How to deploy to GitHub + Streamlit
+## Deploy to GitHub + Streamlit Community Cloud
 
-**All files go in the repository root. No nested directories required.**
+All **17 project files live directly in the repository root**. No subfolders
+are required. Use **`streamlit_app.py`** as the Streamlit entrypoint.
 
-1. Create a GitHub repository, e.g. `an-odds-studio`.
-2. Upload all 12 files from the ZIP directly to the repository root.
-3. At [share.streamlit.io](https://share.streamlit.io), select the repository and `streamlit_app.py`.
-4. Deploy and inspect **Data diagnostics and research methodology** at the bottom.
-5. The optional **Polymarket US** source can be disabled in the sidebar if it is blocked or its quote fields change. US and International are distinct platforms and are never silently conflated.
-6. Adjust API page limits in the sidebar. Higher values take longer and may hit rate limits.
+1. Upload all the files into one GitHub repository, including `requirements.txt`.
+2. Open https://share.streamlit.io and deploy `streamlit_app.py`.
+3. In the sidebar, choose the maximum API scan pages you want (more pages take longer).
+4. Search e.g. `2028 Democratic presidential nominee` and inspect the results.
+5. In **Data diagnostics**, check the Polymarket US /events feed, discovery
+   results, number of candidate pairs and whether any source is unavailable.
 
-### Files
+No API keys are required for the documented public, read-only endpoints, but
+rates/availability may vary. Streamlit Cloud's filesystem is **ephemeral**;
+local database contents disappear after restarts or redeploys.
 
-- `streamlit_app.py` — dark responsive interface, cards, search, category/source filters, optional US feed, export.
-- `feeds.py` — read-only Kalshi event cursor pagination; Polymarket International Gamma event pages and market fallback; optional Polymarket US gateway listing with bounded BBO lookups.
-- `matching.py` — normalized event and outcome matching; 2028 US presidential general versus nomination distinction; year, close-time and outcome guardrails.
-- `core.py` — quote structures, categories, probability formatting, fair moneyline conversion.
-- `model.py` — recency-decayed calibration and paired-outcome Brier weighting **only if** compatible historical observations are supplied.
-- `backfill_history.py` — **experimental partial** historical price+resolution sampler, requires running in a local environment with internet access.
-- `history.csv` — intentionally empty historical observations template.
-- `market_aliases.csv` — optional manually approved exchange event IDs (requires careful settlement-rule review).
-- `requirements.txt`, `test_core.py`, `.gitignore`, `README.md`.
+## What changed in v1.5
 
-### What's new in v1.4
+- **`feeds.py`:** event-first **Polymarket US** integration at
+  `https://gateway.polymarket.us/v1/events`, using nested `markets` and
+  `marketSides`. Only the **long (YES)** side is treated as the positive
+  outcome. A generic NO side is never mislabeled as a candidate.
+- **`feeds.py`:** price parsing from `marketSides.price`, nested `quote`, or
+  documented BBO/price fields. If a price cannot be interpreted in a known
+  0–1 probability representation, no quote is fabricated.
+- **`feeds.py`:** optional Polymarket US `/v1/search` counterpart discovery,
+  alongside International Gamma discovery. If no US event prices are available,
+  the US `/v1/markets` list is used as a fallback.
+- **`matching.py`:** normalized events and outcomes, with conservative checks
+  for mismatched titles, years, participant names, forecast dates and category.
+  Candidate matches are displayed with **POSSIBLE MATCH*** until reviewed.
+- **`mappings.py` + `market_aliases.csv` + `outcome_aliases.csv`:** reviewed event and individual contract mappings are stored
+  in a version-controlled CSV; **only** records with `verified_rules=true`
+  and a named venue are considered reviewed. The app exports new *unverified*
+  pairs as a CSV that the team can examine before committing them to GitHub.
+- **`index_store.py`:** small SQLite table keyed by `(venue, market_id)` for
+  recent normalized quote snapshots. In the dashboard, entries older than
+  **300 seconds** are excluded to avoid treating old observations as live.
+- **`index_markets.py`:** optional, manual/externally scheduled, one-shot
+  indexer. For example `python index_markets.py --kalshi-pages 25 --poly-pages 25 --us-pages 10`.
+- **`test_v15.py`:** regression tests for event grouping, marketSides,
+  search, verified mappings and the short-lived index.
 
-- **Targeted counterpart discovery:** in addition to paginated live feeds, the app looks up a bounded set of high-volume Kalshi events via Polymarket International's official `/public-search` endpoint. Known event identifiers (e.g. 2028 Democratic and Republican presidential nominations) can be looked up by Gamma event slug. Typing a market name triggers additional targeted discovery. All returned quotes are from Polymarket, not PredictionPro. These extra discovery calls can be disabled in the sidebar.
-- **More live-market coverage:** independent pagination caps for Kalshi and Polymarket International. Counts reflect what was scanned, **not exchange-wide totals**.
-- **Optional Polymarket US:** separate public read-only market feed via `gateway.polymarket.us/v1/markets`, with a small number of optional read-only BBO quote lookups. The gateway may return metadata without quote prices; these records are **not** invented or displayed as 0%.
-- **Better matching:** recognizes canonical elections even with reordered titles, e.g. “2028 U.S. Presidential Election winner?” vs “Presidential Election Winner 2028,” while preventing 2028 nominations and general election outcomes from being merged. Preserves the *named* candidate selection (`groupItemTitle`) even if Gamma returns just one binary market; this fixes a bug that mistakenly relabeled some candidates as `Yes`.
-- **Source clarity and volumes:** US quotes are marked `US`; Polymarket International and US have independent identifiers and separate historical calibration. Kalshi event volume explicitly shows **contract count** (`volume_fp` summed once per child market), **not dollar cash turnover**. Polymarket grouped outcomes use each underlying market's reported volume only once rather than double-counting outcomes. The two numbers are not comparable dollar-for-dollar.
-- **Live-only dashboard:** no settled historical contracts appear in the card feed.
-- **Diagnostics:** counts, endpoints, scan-completeness, failures and optional US BBO lookup stats.
-- **Original compact three-column market cards:** Kalshi / Polymarket / AN Model, with current probability above fair American odds, expanded outcomes, table view and CSV export.
+## Crucial caveat: more matching is not automatically better matching
 
-## Historical accuracy model (separate from live listings)
+An apparent match must have identical **resolution rules**, entity or candidate,
+contract date and (for sports) market type. 2028 nomination != 2028 general
+presidential winner. Generic fuzzy matches alone are **never** marked verified.
+Even reviewed event pairs should have **outcome-level identity** checked.
+Sports market comparisons remain particularly conservative to avoid conflating
+moneyline, spread, totals or repeated matchups.
 
-Historical period begins **March 1, 2025**. Default half-life is **18 months**, giving older observations gradually lower training weight.
+Manual verification workflow:
 
-To run a **limited, experimental** historical sample locally:
+1. Download **Export pairs for rule review** from the dashboard.
+2. Download **Export outcome pairs for review** as well, if you need
+   stable identity mappings for renamed candidate/contract titles.
+3. Open both exchange links and compare the actual contract settlement rules.
+4. Set `verified_rules=true` only on explicitly checked event or outcome lines.
+5. Copy them into the repository-root `market_aliases.csv` and
+   `outcome_aliases.csv` respectively. Keep both CSV column headers unchanged.
+6. Redeploy. Unreviewed proposals must not be automatically promoted.
 
-```bash
-pip install -r requirements.txt
-python backfill_history.py --source kalshi --max-markets 250
-python backfill_history.py --source polymarket --max-markets 250
-pytest -q
-streamlit run streamlit_app.py
-```
+### Volume metrics
 
-**This is not a turnkey archive or validated model.** The sampler covers limited resolved binary contracts and the available history endpoints; it can return zero rows if historical snapshots are unavailable. For a production model, build a comprehensive historical ETL with normalized event/outcome IDs, settled outcomes, aligned 7-day/1-day forecasting horizons, liquidity filters, contract-rule checks and time-ordered out-of-sample backtesting. Use matched-event Brier scores and calibrators evaluated on unseen outcomes. In particular, **do not count a model's guessed probability as a historical observation**.
+Kalshi's `volume_fp` is a count of **contracts traded**; Polymarket volumes may
+be reported on a different basis. Do not add them, compare them as equivalent
+cash trading volume, or equate them to PredictionPro's separate volume label.
+Polymarket multi-outcome contracts use one volume per underlying market, not
+one volume multiplied by the number of outcome quotes.
 
-For platform-specific calibration, `history.csv` takes `platform` values `Kalshi`, `Polymarket` and, *if separately backfilled and verified*, `Polymarket US`. **The included sampler does not currently backfill Polymarket US**. Accuracy trained on International data must not be reused as US accuracy.
+### Live coverage vs. resolved history
 
-## Live API references
+- **Active markets**: sourced from live exchange APIs. Scan page caps mean
+  the total active inventory is **not guaranteed** to be complete. The search
+  tool expands discovery beyond the initial ranking, but may still miss markets.
+- **Indexing**: the local SQLite cache lasts only within one writable runtime.
+  The 300-second display TTL guards against obvious stale quotes; it does not
+  prove a contract is still open at display time. A true 24/7 market index
+  requires an external durable database and a scheduled ingestion worker.
+- **Historical settled markets**: **not displayed** in the live dashboard.
+  `history.csv` is a template for pre-resolution probability snapshots and
+  actual resolved outcomes starting **2025-03-01**.
+- **AN probability**: a provisional 50/50 blend until sufficient independently
+  verified historical observations are loaded and out-of-sample calibration
+  tests have passed. A prediction shown for an automated candidate pair
+  requires independent rule verification before public use.
+- **American moneyline**: mathematical fair-odds conversion, not an executable
+  sportsbook price, a wager recommendation or trading offer.
 
-- [Kalshi Get Events](https://docs.kalshi.com/api-reference/events/get-events)
-- [Polymarket International market discovery](https://docs.polymarket.com/market-data/discover-markets)
-- [Polymarket official public search](https://docs.polymarket.com/api-reference/search/search-markets-events-and-profiles)
-- [Polymarket Gamma event by slug](https://docs.polymarket.com/api-reference/events/get-event-by-slug)
-- [Polymarket US read-only data guide](https://docs.polymarket.us/data-guide/overview)
+## Source documentation
 
-## Limits and safeguards
+- Kalshi: https://docs.kalshi.com/api-reference/events/get-events
+- Polymarket Intl Gamma: https://docs.polymarket.com/developers/gamma-markets-api/overview
+- Polymarket US events: https://docs.polymarket.us/api-reference/events/get-events
+- Polymarket US markets: https://docs.polymarket.us/api-reference/markets/get-markets
+- Polymarket US market BBO: https://docs.polymarket.us/api-reference/markets/get-market-bbo
+- Polymarket US search: https://docs.polymarket.us/api-reference/search/search
 
-- **Live API calls were not verifiable in the artifact-generation environment**. The API parsers, targeted discovery, volume de-duplication and matching are covered by 21 automated unit tests with simulated API responses; inspect live integration on Streamlit.
-- An automated event match does **not** prove identical exchange settlement criteria. In production, compare the legal rules for each paired contract and review matches manually/through a certified rules engine.
-- A Kalshi `volume_fp` is a cumulative **count of $1-face contracts** traded across child markets, **not the dollars spent buying positions**. The number can legitimately be far larger than the `$ volume` shown by another provider. For the 2028 Democratic nominee, approximately 250 million Kalshi contracts traded around October 30, 2026, consistent with Kalshi's own site. PredictionPro's $9.6 million is not sufficiently documented in the provided screenshot to infer its metric. Do not replace source volume with third-party figures or treat them as directly comparable.
-- Targeted search is bounded for speed and does not guarantee every market will match; users can raise page limits or search for specific markets. Matched events are still **candidates**, and resolution rules can differ.
-- Polymarket International and US are separate trading venues; US public API fields may differ. Some US listings require BBO requests and unpriced contracts are omitted. The dashboard will show failures in diagnostics rather than silently fabricating a quote.
-- The source HTML provided for comparison was used to understand event representation and match-testing requirements, **not as a data source or a dependency**; this application reads the exchanges directly.
-- The interface is an independently written research prototype; no competing site's assets, artwork or proprietary source-code bundles are included.
-- Before public launch, verify data licensing, market-data redistribution, gambling/financial promotions compliance, model validation and disclosure language with Action Network's appropriate reviewers.
+## Testing
+
+Run: `python -m pytest -q`. Latest run: **31 tests passed** using fixture data;
+no live exchange API calls or Streamlit browser session were tested here.
+
+**Do not commit populated historical/private datasets or runtime SQLite files
+without checking usage permissions and data sensitivity.** The `.gitignore`
+excludes temporary runtime files. Historic data collection, perpetual indexing,
+and a statistically validated AN model are separate future workstreams.

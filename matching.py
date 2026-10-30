@@ -7,6 +7,7 @@ for public use, review the actual contracts.
 from __future__ import annotations
 from dataclasses import dataclass
 from collections import defaultdict
+from datetime import datetime,timezone
 import re
 from rapidfuzz import fuzz
 from core import Quote, clean_text, date_from_string
@@ -28,6 +29,7 @@ class MarketCard:
     matched:bool
     match_score:float=0.0
     poly_venue:str=''
+    rule_reviewed:bool=False
 
 STATES={
  'alabama':'AL','alaska':'AK','arizona':'AZ','arkansas':'AR','california':'CA','colorado':'CO',
@@ -96,14 +98,22 @@ def close_compatible(k:Quote,p:Quote):
 def outcome_compatible(k:Quote,p:Quote,single_k=False,single_p=False):
     a,b=clean_text(str(k.outcome).replace(".","")),clean_text(str(p.outcome).replace(".",""))
     if a and b and a==b:return True
+    aliases={'democrat':'democratic party','democrats':'democratic party',
+             'republican':'republican party','republicans':'republican party',
+             'gop':'republican party','democratic nominee':'democratic party',
+             'republican nominee':'republican party'}
+    if a and b and aliases.get(a,a)==aliases.get(b,b):return True
     if a and b and min(len(a),len(b))>=8 and fuzz.ratio(a,b)>=92:return True
     if single_k and single_p and a in ('','yes') and b in ('','yes'):
         return fuzz.ratio(clean_text(k.question),clean_text(p.question))>=96
     return False
 
 
-def _rows_matchable(ks,ps):
-    return any(outcome_compatible(k,p,len(ks)==1,len(ps)==1) and close_compatible(k,p) for k in ks for p in ps)
+def _rows_matchable(ks,ps,verified_outcomes=None):
+    verified_outcomes=verified_outcomes or set()
+    return any((outcome_compatible(k,p,len(ks)==1,len(ps)==1) or
+                (k.market_id,p.exchange,p.market_id) in verified_outcomes)
+               and close_compatible(k,p) for k in ks for p in ps)
 
 
 def event_volumes(rows):
@@ -122,16 +132,18 @@ def event_volumes(rows):
     return sum(k.values()), sum(poly.values())
 
 
-def _card_title(title,category,rows,matched=False,score=0.0):
+def _card_title(title,category,rows,matched=False,score=0.0,reviewed=False):
     venue=next((r.polymarket.exchange for r in rows if r.polymarket),'')
     # Kalshi volume is contracts, Polymarket volume is dollars. DO NOT ADD them.
-    # Sorting by their combined numeric values creates a misleading comparison.
+    # Rank Kalshi-present cards by Kalshi contracts; Polymarket-only cards
+    # by their own volume. The separate lists are alternated, not cross-compared.
     k_total, p_total = event_volumes(rows)
-    return MarketCard(title,category,rows,max(k_total,p_total),matched,score,venue)
+    return MarketCard(title,category,rows,k_total if k_total else p_total,matched,score,venue,reviewed)
 
 
-def combine_quotes(kalshi:list[Quote],polymarket:list[Quote],aliases:dict|None=None):
+def combine_quotes(kalshi:list[Quote],polymarket:list[Quote],aliases:dict|None=None,outcome_aliases:set|None=None):
     aliases=aliases or {}
+    outcome_aliases=outcome_aliases or set()
     groups=defaultdict(list)
     for q in kalshi+polymarket:
         groups[(q.exchange,q.event_id)].append(q)
@@ -153,10 +165,18 @@ def combine_quotes(kalshi:list[Quote],polymarket:list[Quote],aliases:dict|None=N
         for pk in candidates:
             if pk in used_p:continue
             ps=p_events[pk]
-            explicit=aliases.get(ks[0].event_id)==ps[0].event_id
-            score=100.0 if explicit else event_match_score(ks[0].event_title,ps[0].event_title,cat)
+            reviewed=(pk[0],ps[0].event_id) in aliases.get(ks[0].event_id,[]) if isinstance(aliases.get(ks[0].event_id),list) else False
+            # Support pre-v1.5 direct event aliases only as suggestions, not verified.
+            score=100.0 if reviewed else event_match_score(ks[0].event_title,ps[0].event_title,cat)
             if score < (97 if cat=='Sports' else 92):continue
-            if not _rows_matchable(ks,ps):continue
+            if not _rows_matchable(ks,ps,outcome_aliases):continue
+            # Generic sports title pairs also require timestamps on BOTH sides.
+            # For sports, the same matchup may happen repeatedly within a season.
+            if cat=='Sports' and not reviewed:
+                ka=date_from_string(ks[0].close_at)
+                pa=date_from_string(ps[0].close_at)
+                if ka is None or pa is None or abs((ka-pa).total_seconds())>2*86400:
+                    continue
             # When both international and US are present, prefer US for comparable
             # US-only political events, but never fuse them into one column.
             if score > best_score or (score==best_score and pk[0]=='Polymarket US'):
@@ -168,13 +188,15 @@ def combine_quotes(kalshi:list[Quote],polymarket:list[Quote],aliases:dict|None=N
             found=None
             for p in paired:
                 if p.market_id in used_rows:continue
-                if outcome_compatible(k,p,len(ks)==1,len(paired)==1) and close_compatible(k,p):
+                explicit_outcome=(k.market_id,p.exchange,p.market_id) in outcome_aliases
+                if (explicit_outcome or outcome_compatible(k,p,len(ks)==1,len(paired)==1)) and close_compatible(k,p):
                     found=p;used_rows.add(p.market_id);break
             rows.append(Row(k.outcome if clean_text(k.outcome)!='yes' else 'Yes',k,found))
         for p in paired:
             if p.market_id not in used_rows:
                 rows.append(Row(p.outcome,None,p))
-        cards.append(_card_title(ks[0].event_title,cat,rows,bool(best_pk),best_score))
+        verified=bool(best_pk) and (best_pk[0],paired[0].event_id) in aliases.get(ks[0].event_id,[]) if isinstance(aliases.get(ks[0].event_id),list) else False
+        cards.append(_card_title(ks[0].event_title,cat,rows,bool(best_pk),best_score,verified))
     for pk,ps in p_events.items():
         if pk in used_p:continue
         cards.append(_card_title(ps[0].event_title,ps[0].category,[Row(p.outcome,None,p) for p in ps]))
