@@ -16,8 +16,9 @@ import pandas as pd
 import streamlit as st
 
 from core import CATEGORY_NAMES, american, date_from_string
-from feeds import FeedError, fetch_kalshi, fetch_polymarket, fetch_polymarket_us
-from matching import combine_quotes
+from feeds import (FeedError, fetch_kalshi, fetch_polymarket, fetch_polymarket_us,
+                   fetch_polymarket_search, fetch_polymarket_slug, merge_quotes, KNOWN_GAMMA_SLUGS)
+from matching import combine_quotes, canonical_event_key, event_volumes
 from model import AccuracyModel, read_history
 
 st.set_page_config(
@@ -130,6 +131,8 @@ with st.sidebar:
     us_bbo = st.select_slider("US price lookups for unpriced listings", options=[0, 10, 24, 50], value=24, disabled=not include_us,
                               help="US listings can omit prices. Optional read-only BBO lookups make separate requests and may take longer.")
     st.caption("These controls set *scan limits*, not guaranteed totals. Feeds refresh from public endpoints every two minutes.")
+    auto_search = st.checkbox("Find counterparts beyond scanned pages", value=True,
+                              help="Fetch matching markets directly from official Polymarket search/slug endpoints. Uses a small number of extra API calls.")
     st.divider()
     st.markdown("**Experimental AN model**")
     st.caption("Historical start: March 1, 2025 · 18-month half-life. With no validated history, the AN column is an unvalidated 50/50 benchmark.")
@@ -155,6 +158,62 @@ def load_live(k_pages: int, p_pages: int, us_on: bool, u_pages: int, bbo_limit: 
             errors[platform] = str(ex)[:270]
             diagnostics[platform] = {"events_scanned": 0, "complete": False, "endpoint": "Unavailable"}
     return quotes, diagnostics, errors, datetime.now(timezone.utc).isoformat()
+
+@st.cache_data(ttl=300, show_spinner=False)
+def targeted_discovery(kalshi_quotes, query, enabled=True):
+    """Discover a few event counterparts missed by top-24h-volume pagination.
+
+    Only official Gamma prices are used. Search is bounded to limit API calls.
+    Failures do not block the dashboard; they are reported in diagnostics.
+    """
+    if not enabled:
+        return [], [], []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    tasks = []
+    # A meaningful direct search must work even for an event absent from Kalshi's scan.
+    if len(query.strip()) >= 5:
+        tasks.append(('search', query.strip()[:130]))
+    # Find frequently searched, long-duration political counterparts by stable slug.
+    groups = {}
+    for item in kalshi_quotes:
+        key = canonical_event_key(item.event_title, item.category)
+        if key in KNOWN_GAMMA_SLUGS:
+            groups[key] = max(groups.get(key, 0), item.volume)
+    for key in sorted(groups, key=lambda k: -groups[k])[:4]:
+        tasks.append(('slug', KNOWN_GAMMA_SLUGS[key]))
+    # Search the most active Kalshi events by event TOTAL, not just by individual
+    # child contract; a top-volume market can be absent from the Polymarket 24h scan.
+    # Discovery never means automatic matching: the matching engine checks both sides.
+    totals = {}
+    for q in kalshi_quotes:
+        if q.category != 'Other':
+            totals[q.event_title] = totals.get(q.event_title, 0) + q.volume
+    primary = sorted(totals, key=lambda t: -totals[t])[:6]
+    if len(query.strip()) >= 5:
+        token = query.strip().lower()
+        # Give the user's active search priority over general top-volume coverage.
+        primary = [t for t in totals if token in t.lower()][:3] + primary
+    for title in primary:
+        tasks.append(('search', title[:130]))
+    tasks = list(dict.fromkeys(tasks))[:11]
+    rows, info, errors = [], [], []
+    def execute(task):
+        mode, argument = task
+        if mode == 'slug':
+            return fetch_polymarket_slug(argument), mode + ':' + argument
+        result, _ = fetch_polymarket_search(argument)
+        return result, mode + ':' + argument
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(execute, t): t for t in tasks}
+        for future in as_completed(futures):
+            try:
+                result, label = future.result()
+                rows.extend(result)
+                info.append(f'{label} → {len(result)} quotes')
+            except Exception as exc:
+                mode, argument = futures[future]
+                errors.append(f'{mode}:{argument} → {str(exc)[:130]}')
+    return merge_quotes(rows), sorted(info), sorted(errors)
 
 st.markdown('''<div class="an-nav"><div class="an-nav-left"><div class="an-logo"><span class="an-logo-mark">A</span> ACTION NETWORK <span style="color:#8d9fbe;font-size:12px;font-weight:600">/ ODDS STUDIO</span></div><span class="an-nav-item active">Markets</span><span class="an-nav-item">Live intelligence</span></div><span class="an-nav-tag">INTERNAL PROTOTYPE</span></div>''', unsafe_allow_html=True)
 st.markdown('''<div class="an-head"><div class="an-title">Markets Dashboard</div><div class="an-subtitle">Browse active Kalshi and Polymarket markets side by side, with Action Network fair-odds estimates where outcomes can be matched.</div></div>''', unsafe_allow_html=True)
@@ -188,9 +247,6 @@ if ALIASES.exists():
             if k and p:
                 aliases[k] = p
 
-cards = combine_quotes(live["Kalshi"], live["Polymarket"] + live["Polymarket US"], aliases)
-model = AccuracyModel(read_history(HISTORY))
-matched_total = sum(1 for c in cards if c.matched)
 
 if errors:
     for name, error in errors.items():
@@ -210,6 +266,15 @@ with t_refresh:
     if st.button("↻", help="Refresh the live feeds (2-minute cache)", use_container_width=True):
         load_live.clear()
         st.rerun()
+
+# Search beyond the limited high-volume scan; preserve unique exchange venue IDs.
+extra_poly, discovery_info, discovery_errors = targeted_discovery(
+    live["Kalshi"], search or "", auto_search
+)
+poly_all = merge_quotes(live["Polymarket"], live["Polymarket US"], extra_poly)
+cards = combine_quotes(live["Kalshi"], poly_all, aliases)
+model = AccuracyModel(read_history(HISTORY))
+matched_total = sum(1 for c in cards if c.matched)
 
 cat_col, count_col = st.columns([5.8, 1], vertical_alignment="center", gap="small")
 with cat_col:
@@ -325,12 +390,13 @@ def card_markup(card):
     )
     kalshi = {q.market_id: q for r in card.rows for q in (r.kalshi,) if q}
     poly = {q.market_id: q for r in card.rows for q in (r.polymarket,) if q}
+    k_total, p_total = event_volumes(card.rows)
     source_info = []
     if kalshi:
-        source_info.append("K " + compact_volume(sum(q.volume for q in kalshi.values())) + " contracts")
+        source_info.append("Kalshi: " + compact_volume(k_total) + " contracts traded")
     if poly:
         venue = next(iter(poly.values())).exchange
-        source_info.append(("P-US " if venue == "Polymarket US" else "P $") + compact_volume(sum(q.volume for q in poly.values())) + " vol")
+        source_info.append(("Polymarket US: " if venue == "Polymarket US" else "Polymarket Intl: ") + compact_volume(p_total) + " reported vol")
     source_links = []
     for source, group in (("Kalshi", kalshi), ("Polymarket", poly)):
         if group:
@@ -342,7 +408,7 @@ def card_markup(card):
 
 # Pagination follows the cards, not above them.
 PAGE_SIZE = 18
-filter_key = (search_normalized, chosen, source_view, layout, kalshi_pages, poly_pages, include_us, us_pages, us_bbo)
+filter_key = (search_normalized, chosen, source_view, layout, kalshi_pages, poly_pages, include_us, us_pages, us_bbo, auto_search)
 if st.session_state.get("last_filter") != filter_key:
     st.session_state["last_filter"] = filter_key
     st.session_state["page"] = 1
@@ -435,6 +501,15 @@ with st.expander("Data diagnostics and research methodology"):
             f"Endpoint {d.get('endpoint', '/events')}."
         )
     st.write(f"Potentially matched event pairs: **{matched_total:,}**. These are candidate matches; settlement criteria still need verification.")
+    st.markdown("**Targeted Polymarket discovery (beyond paginated scans)**")
+    if discovery_info:
+        for item in discovery_info:
+            st.caption(item)
+    else:
+        st.caption("No additional search results requested.")
+    if discovery_errors:
+        for item in discovery_errors:
+            st.caption("Discovery issue: " + item)
     st.caption("Polymarket US and International are separate exchanges with different market lists and histories. Our calibration does not transfer accuracy estimates between the two.")
     st.markdown("**Live vs. historical markets**")
     st.markdown(
@@ -449,7 +524,8 @@ with st.expander("Data diagnostics and research methodology"):
     st.markdown(
         "**Important:** market counts reflect API page caps, not all listings on the exchanges. "
         "A missing opposite-exchange quote means there is no sufficiently reliable match in the scanned data. "
-        "Kalshi contract volumes and Polymarket dollar volumes must not be combined or treated as equivalent. "
+        "Kalshi volume is the reported number of $1-face-value contracts traded, not the cash paid to trade them. "
+        "Polymarket reported volume may use a different accounting convention. Do not compare these figures as equivalent cash amounts. "
         "Check actual market rules, fees and settlement criteria before publication."
     )
 

@@ -19,7 +19,7 @@ class FeedError(RuntimeError):
 
 def session():
     s=requests.Session()
-    s.headers.update({'User-Agent':'AN-Odds-Studio-Internal-Research/1.3', 'Accept':'application/json'})
+    s.headers.update({'User-Agent':'AN-Odds-Studio-Internal-Research/1.4', 'Accept':'application/json'})
     retries=Retry(total=2, connect=2, read=1, backoff_factor=.5,
                   status_forcelist=[429,500,502,503,504], allowed_methods=['GET'])
     s.mount('https://',HTTPAdapter(max_retries=retries,pool_connections=12,pool_maxsize=12))
@@ -95,7 +95,18 @@ def _poly_market(m,event):
     link=f'https://polymarket.com/event/{slug}'
     is_binary=len(outs)==2 and [str(o).strip().lower() for o in outs]==['yes','no']
     label=m.get('groupItemTitle') or m.get('question') or 'Yes'
-    if is_binary and len(event.get('markets') or [])==1:label='Yes'
+    # Preserve the named selection even if API returns only one binary child.
+    if is_binary and not m.get('groupItemTitle'):
+        # Some grouped events omit groupItemTitle but put the candidate in the
+        # contract question. Only infer a label for a very specific nomination
+        # question; otherwise preserve the question / generic Yes accurately.
+        if any(term in str(title).lower() for term in ('nominee', 'nomination')):
+            import re
+            match=re.match(r"^(?:will|does|can)\s+([a-z][a-z .'-]{2,65}?)\s+(?:be|win|become|get)\b",str(m.get('question') or ''),re.I)
+            if match:
+                label=match.group(1).strip()
+        if len(event.get('markets') or [])==1 and label==str(m.get('question') or 'Yes'):
+            label='Yes'
     out=[]
     for i,(name,value) in enumerate(zip(outs,prices)):
         if is_binary and i==1:continue
@@ -279,3 +290,69 @@ def fetch_polymarket_us(max_pages=3,bbo_limit=24):
     return quotes,{'events_scanned':scanned,'complete':exhausted,'endpoint':'US /v1/markets',
                    'pages':page+1,'quotes':len(quotes),'unpriced':unpriced,
                    'bbo_lookups':bbo_used,'bbo_errors':bbo_errors}
+
+
+# Named, recognizable events are fetched from the exchange itself by slug. No
+# odds or outcomes are hard-coded. These are discovery hints, not quote sources.
+KNOWN_GAMMA_SLUGS = {
+    ('politics', 'us-president-nominee-dem-2028'): 'democratic-presidential-nominee-2028',
+    ('politics', 'us-president-nominee-rep-2028'): 'republican-presidential-nominee-2028',
+}
+
+
+def _gamma_event_rows(payload):
+    """Normalize nested events from Gamma /events or /public-search."""
+    if isinstance(payload, dict):
+        events = payload.get('events') or []
+    elif isinstance(payload, list):
+        events = payload
+    else:
+        events = []
+    result = []
+    for ev in events:
+        if not isinstance(ev, dict) or ev.get('closed') is True or ev.get('active') is False:
+            continue
+        for market in ev.get('markets') or []:
+            if isinstance(market, dict):
+                result.extend(_poly_market(market, ev))
+    return result
+
+
+def fetch_polymarket_search(query: str, limit: int = 30):
+    """Use documented Gamma public search to find markets outside the top-volume scan.
+
+    Returns quotes with the exact same identifiers as the ordinary Gamma feed.
+    Searches only active events; verification of event rules is still required.
+    """
+    query = str(query).strip()
+    if len(query) < 4 or len(query) > 150:
+        return [], {'events_scanned': 0, 'quotes': 0, 'endpoint': '/public-search'}
+    s = session()
+    payload = get_json(s, f'{POLY}/public-search', {
+        'q': query, 'limit_per_type': max(5, min(50, int(limit))),
+        'events_status': 'active', 'keep_closed_markets': 0,
+    })
+    if not isinstance(payload, dict):
+        raise FeedError('Gamma public search returned unexpected data')
+    events = payload.get('events') or []
+    rows = _gamma_event_rows(payload)
+    return rows, {'events_scanned': len(events), 'quotes': len(rows),
+                  'endpoint': '/public-search', 'query': query}
+
+
+def fetch_polymarket_slug(slug: str):
+    """Retrieve one known event by exact slug from the official Gamma event API."""
+    slug = str(slug).strip()
+    if not slug or '/' in slug or len(slug) > 150:
+        return []
+    response = get_json(session(), f'{POLY}/events', {'slug': slug})
+    return _gamma_event_rows(response)
+
+
+def merge_quotes(*lists):
+    """Remove duplicate contract outcomes when discovery and paginated scans overlap."""
+    unique = {}
+    for batch in lists:
+        for q in batch:
+            unique[(q.exchange, q.market_id)] = q
+    return list(unique.values())

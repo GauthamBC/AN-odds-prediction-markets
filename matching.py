@@ -106,12 +106,27 @@ def _rows_matchable(ks,ps):
     return any(outcome_compatible(k,p,len(ks)==1,len(ps)==1) and close_compatible(k,p) for k in ks for p in ps)
 
 
+def event_volumes(rows):
+    """Kalshi quotes are individual contracts; Polymarket can expose several
+    outcomes of a single multi-outcome contract with a shared market volume.
+    Count that shared Polymarket market volume once, never once per outcome.
+    These totals are NOT commensurate cash-flow measures.
+    """
+    k = {r.kalshi.market_id: r.kalshi.volume for r in rows if r.kalshi}
+    poly = {}
+    for r in rows:
+        if r.polymarket:
+            q = r.polymarket
+            base_id = q.market_id.rsplit(':', 1)[0] if q.market_id.rsplit(':', 1)[-1].isdigit() else q.market_id
+            poly[(q.exchange, base_id)] = q.volume
+    return sum(k.values()), sum(poly.values())
+
+
 def _card_title(title,category,rows,matched=False,score=0.0):
     venue=next((r.polymarket.exchange for r in rows if r.polymarket),'')
     # Kalshi volume is contracts, Polymarket volume is dollars. DO NOT ADD them.
     # Sorting by their combined numeric values creates a misleading comparison.
-    k_total=sum(q.volume for q in {r.kalshi.market_id:r.kalshi for r in rows if r.kalshi}.values())
-    p_total=sum(q.volume for q in {r.polymarket.market_id:r.polymarket for r in rows if r.polymarket}.values())
+    k_total, p_total = event_volumes(rows)
     return MarketCard(title,category,rows,max(k_total,p_total),matched,score,venue)
 
 

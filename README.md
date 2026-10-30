@@ -1,4 +1,4 @@
-# AN Odds Studio — Streamlit prototype v1.3
+# AN Odds Studio — Streamlit prototype v1.4
 
 An **internal research prototype** for Action Network, showing active prediction-market quotes from **Kalshi**, **Polymarket International** and optionally **Polymarket US**. It attempts conservative cross-venue matching, shows probabilities and their **fair American-moneyline equivalents**, and offers an experimental AN model column.
 
@@ -27,12 +27,13 @@ An **internal research prototype** for Action Network, showing active prediction
 - `market_aliases.csv` — optional manually approved exchange event IDs (requires careful settlement-rule review).
 - `requirements.txt`, `test_core.py`, `.gitignore`, `README.md`.
 
-### What's new in v1.3
+### What's new in v1.4
 
+- **Targeted counterpart discovery:** in addition to paginated live feeds, the app looks up a bounded set of high-volume Kalshi events via Polymarket International's official `/public-search` endpoint. Known event identifiers (e.g. 2028 Democratic and Republican presidential nominations) can be looked up by Gamma event slug. Typing a market name triggers additional targeted discovery. All returned quotes are from Polymarket, not PredictionPro. These extra discovery calls can be disabled in the sidebar.
 - **More live-market coverage:** independent pagination caps for Kalshi and Polymarket International. Counts reflect what was scanned, **not exchange-wide totals**.
 - **Optional Polymarket US:** separate public read-only market feed via `gateway.polymarket.us/v1/markets`, with a small number of optional read-only BBO quote lookups. The gateway may return metadata without quote prices; these records are **not** invented or displayed as 0%.
-- **Better matching:** recognizes canonical elections even with reordered titles, e.g. “2028 U.S. Presidential Election winner?” vs “Presidential Election Winner 2028,” while preventing 2028 nominations and general election outcomes from being merged.
-- **Source clarity:** US quotes are marked `US`; Polymarket International and US have independent identifiers and separate historical calibration.
+- **Better matching:** recognizes canonical elections even with reordered titles, e.g. “2028 U.S. Presidential Election winner?” vs “Presidential Election Winner 2028,” while preventing 2028 nominations and general election outcomes from being merged. Preserves the *named* candidate selection (`groupItemTitle`) even if Gamma returns just one binary market; this fixes a bug that mistakenly relabeled some candidates as `Yes`.
+- **Source clarity and volumes:** US quotes are marked `US`; Polymarket International and US have independent identifiers and separate historical calibration. Kalshi event volume explicitly shows **contract count** (`volume_fp` summed once per child market), **not dollar cash turnover**. Polymarket grouped outcomes use each underlying market's reported volume only once rather than double-counting outcomes. The two numbers are not comparable dollar-for-dollar.
 - **Live-only dashboard:** no settled historical contracts appear in the card feed.
 - **Diagnostics:** counts, endpoints, scan-completeness, failures and optional US BBO lookup stats.
 - **Original compact three-column market cards:** Kalshi / Polymarket / AN Model, with current probability above fair American odds, expanded outcomes, table view and CSV export.
@@ -59,13 +60,16 @@ For platform-specific calibration, `history.csv` takes `platform` values `Kalshi
 
 - [Kalshi Get Events](https://docs.kalshi.com/api-reference/events/get-events)
 - [Polymarket International market discovery](https://docs.polymarket.com/market-data/discover-markets)
+- [Polymarket official public search](https://docs.polymarket.com/api-reference/search/search-markets-events-and-profiles)
+- [Polymarket Gamma event by slug](https://docs.polymarket.com/api-reference/events/get-event-by-slug)
 - [Polymarket US read-only data guide](https://docs.polymarket.us/data-guide/overview)
 
 ## Limits and safeguards
 
-- **Live API calls were not verifiable in the artifact-generation environment**. The API parsers are covered by mocked unit tests; inspect live integration on Streamlit.
+- **Live API calls were not verifiable in the artifact-generation environment**. The API parsers, targeted discovery, volume de-duplication and matching are covered by 21 automated unit tests with simulated API responses; inspect live integration on Streamlit.
 - An automated event match does **not** prove identical exchange settlement criteria. In production, compare the legal rules for each paired contract and review matches manually/through a certified rules engine.
-- A Kalshi trading-volume count is not equivalent to a Polymarket USD traded-volume measure; they aren't combined.
+- A Kalshi `volume_fp` is a cumulative **count of $1-face contracts** traded across child markets, **not the dollars spent buying positions**. The number can legitimately be far larger than the `$ volume` shown by another provider. For the 2028 Democratic nominee, approximately 250 million Kalshi contracts traded around October 30, 2026, consistent with Kalshi's own site. PredictionPro's $9.6 million is not sufficiently documented in the provided screenshot to infer its metric. Do not replace source volume with third-party figures or treat them as directly comparable.
+- Targeted search is bounded for speed and does not guarantee every market will match; users can raise page limits or search for specific markets. Matched events are still **candidates**, and resolution rules can differ.
 - Polymarket International and US are separate trading venues; US public API fields may differ. Some US listings require BBO requests and unpriced contracts are omitted. The dashboard will show failures in diagnostics rather than silently fabricating a quote.
 - The source HTML provided for comparison was used to understand event representation and match-testing requirements, **not as a data source or a dependency**; this application reads the exchanges directly.
 - The interface is an independently written research prototype; no competing site's assets, artwork or proprietary source-code bundles are included.

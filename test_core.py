@@ -64,7 +64,7 @@ def test_polymarket_fetch_reads_nested_event(monkeypatch):
     quotes,meta=feeds.fetch_polymarket(3)
     assert len(quotes)==1
     assert quotes[0].exchange=='Polymarket'
-    assert quotes[0].outcome=='Yes' # Single binary event, show YES
+    assert quotes[0].outcome=='Team A' # A named child contract retains its label
     assert quotes[0].probability==.73
     assert meta['endpoint']=='/events'
     assert meta['complete']
@@ -176,3 +176,72 @@ def test_matching_us_does_not_use_international_history():
     m=AccuracyModel([])
     r=m.predict(k,p)
     assert abs(r['probability']-.65)<1e-10 and r['paired_samples']==0 and not r['calibrated']
+
+
+def test_targeted_slug_discovers_2028_democratic_nomination(monkeypatch):
+    import feeds
+    source_event = {
+        'id':'p-dem-2028','slug':'democratic-presidential-nominee-2028',
+        'title':'Democratic Presidential Nominee 2028','active':True,'closed':False,
+        'tags':[{'label':'Politics'}],
+        'markets':[{'id':'gavin-market','groupItemTitle':'Gavin Newsom',
+                    'outcomes':'["Yes","No"]','outcomePrices':'["0.17","0.83"]',
+                    'volumeNum':9_600_000,'active':True,'closed':False}]}
+    seen=[]
+    def mock_get_json(_,url,params):
+        seen.append((url,params))
+        return [source_event]
+    monkeypatch.setattr(feeds,'session',lambda:object())
+    monkeypatch.setattr(feeds,'get_json',mock_get_json)
+    discovered=feeds.fetch_polymarket_slug('democratic-presidential-nominee-2028')
+    assert len(discovered)==1
+    assert discovered[0].outcome=='Gavin Newsom'
+    assert discovered[0].probability==.17
+    assert seen[0][1]=={'slug':'democratic-presidential-nominee-2028'}
+    kalshi=q('Kalshi','Gavin Newsom',.16,event_id='KXPRESNOMD-28',
+             title='2028 Democratic presidential nominee')
+    kalshi.category='Politics'
+    cards=combine_quotes([kalshi],discovered)
+    assert len(cards)==1 and cards[0].matched
+    assert cards[0].rows[0].polymarket.probability==.17
+
+
+def test_gamma_search_uses_documented_parameter_and_excludes_closed(monkeypatch):
+    import feeds
+    called=[]
+    def fake_json(_,url,params):
+        called.append((url,params))
+        return {'events':[
+            {'id':'active','title':'2028 Democratic presidential nominee', 'active':True,'closed':False,
+             'markets':[{'id':'1','groupItemTitle':'Gavin Newsom', 'outcomes':'["Yes","No"]',
+                         'outcomePrices':'["0.17","0.83"]','active':True,'closed':False}]},
+            {'id':'ended','title':'Resolved event','active':False,'closed':True,
+             'markets':[{'id':'2','outcomes':'["Yes","No"]','outcomePrices':'["0.9","0.1"]'}]},
+        ]}
+    monkeypatch.setattr(feeds,'session',lambda:object())
+    monkeypatch.setattr(feeds,'get_json',fake_json)
+    data,meta=feeds.fetch_polymarket_search('Democratic presidential nominee')
+    assert len(data)==1 and data[0].outcome=='Gavin Newsom'
+    assert '/public-search' in called[0][0]
+    assert called[0][1]['q']=='Democratic presidential nominee'
+    assert meta['events_scanned']==2
+
+
+def test_polymarket_multiple_outcomes_do_not_repeat_market_volume():
+    from matching import Row, event_volumes
+    p1=q('Polymarket','Team A',.6,event_id='p')
+    p2=q('Polymarket','Team B',.4,event_id='p')
+    p1.market_id='one-market:0';p2.market_id='one-market:1'
+    p1.volume=p2.volume=9600000
+    k_total,p_total=event_volumes([Row('Team A',None,p1),Row('Team B',None,p2)])
+    assert k_total==0 and p_total==9600000
+
+
+def test_polymarket_nomination_candidate_from_specific_question():
+    ev={'id':'nom','title':'Democratic Presidential Nominee 2028',
+        'markets':[{'id':'m'}]}
+    market={'id':'m','question':'Will Gavin Newsom win the 2028 Democratic presidential nomination?',
+            'outcomes':'["Yes","No"]','outcomePrices':'["0.17","0.83"]',
+            'active':True,'closed':False}
+    rows=_poly_market(market,ev)
+    assert len(rows)==1 and rows[0].outcome=='Gavin Newsom'
