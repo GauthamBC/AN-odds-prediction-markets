@@ -53,7 +53,8 @@ def _kalshi_market(m,event):
                  number(m.get('liquidity_dollars'),number(m.get('open_interest_fp'))),
                  m.get('expected_expiration_time') or m.get('close_time'),
                  f'https://kalshi.com/markets/{eid.lower()}',
-                 (m.get('rules_primary') or '')[:800])
+                 (m.get('rules_primary') or '')[:800], volume_24h=number(m.get('volume_24h_fp',m.get('volume_24h'))),
+                 image_url=str(event.get('image_url') or event.get('image') or m.get('image_url') or ''))
 
 
 def fetch_kalshi(max_pages=8):
@@ -116,7 +117,9 @@ def _poly_market(m,event):
         out.append(Quote('Polymarket',f'{mid}:{i}',eid,title,m.get('question') or title,
                          str(outcome),p,kind,number(m.get('volumeNum',m.get('volume'))),
                          number(m.get('liquidityNum',m.get('liquidity'))),
-                         m.get('endDate') or event.get('endDate'),link,(m.get('description') or '')[:800]))
+                         m.get('endDate') or event.get('endDate'),link,(m.get('description') or '')[:800],
+                         volume_24h=number(m.get('volume24hr', m.get('volume24hrNum', m.get('volume_24hr')))),
+                         image_url=str(event.get('image') or event.get('icon') or m.get('image') or '')))
     return out
 
 
@@ -289,7 +292,9 @@ def _us_rows(m,event=None):
                   number(m.get('liquidity',m.get('openInterest',0))),
                   m.get('endDate') or event.get('endDate') or m.get('gameStartTime'),
                   f'https://polymarket.us/event/{event.get("slug")}' if event.get('slug') else (f'https://polymarket.us/market/{slug}' if slug else 'https://polymarket.us'),
-                  str(m.get('rulesDisclaimer') or m.get('description') or event.get('description') or '')[:800])
+                  str(m.get('rulesDisclaimer') or m.get('description') or event.get('description') or '')[:800],
+                  volume_24h=number(m.get('volume24hr', m.get('volume24h', 0))),
+                  image_url=str(event.get('image') or event.get('icon') or m.get('imageUrl') or ''))
             for outcome,p,side_id in raw_rows if p is not None and 0 < p < 1]
 
 

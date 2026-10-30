@@ -25,6 +25,8 @@ class Quote:
     url: str
     rules: str = ""
     type: str = "binary"
+    volume_24h: float = 0.0
+    image_url: str = ""
 
 
 def number(value, fallback=0.0):

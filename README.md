@@ -1,4 +1,4 @@
-# Action Network Odds Studio — v1.5 (internal Streamlit research prototype)
+# Action Network Odds Studio — v1.6 (internal Streamlit research prototype)
 
 **Status: experimental and read-only.** The dashboard compares **active** markets
 from Kalshi, Polymarket International and Polymarket US (separate venues), then
@@ -12,7 +12,7 @@ data. All live market inputs come from public exchange data services.
 
 ## Deploy to GitHub + Streamlit Community Cloud
 
-All **17 project files live directly in the repository root**. No subfolders
+All **18 project files live directly in the repository root**. No subfolders
 are required. Use **`streamlit_app.py`** as the Streamlit entrypoint.
 
 1. Upload all the files into one GitHub repository, including `requirements.txt`.
@@ -26,7 +26,45 @@ No API keys are required for the documented public, read-only endpoints, but
 rates/availability may vary. Streamlit Cloud's filesystem is **ephemeral**;
 local database contents disappear after restarts or redeploys.
 
-## What changed in v1.5
+## What changed in v1.6: Comparison-first rebuild
+
+This is **not a mirror of PredictionPro's proprietary backend**. Its page
+HTML showed normalized market cards, not how its full database was made. This
+project recreates the useful behavior independently using official exchange
+feeds and the same high-level event/outcome layout.
+
+- **Matching rebuilt:** Indexed candidates by normalized event identity,
+  outcome names and significant title tokens. Event identity + outcome overlap
+  replaces almost-exclusive reliance on fuzzy title matching. Incompatible
+  election years, nomination-vs-general-election contracts, different sports
+  market types and separated game dates are not automatically joined.
+- **Popularity improved:** When the exchange supplies 24-hour volume, cards
+  rank by *recent activity* instead of all-time contract volume. This prevents
+  old long-duration futures with huge lifetime totals from automatically
+  dominating every category.
+- **Visuals:** Exchange event artwork appears where officially provided, with
+  category icons as fallback. The compact three-column dashboard remains.
+- **Counterpart search:** The targeted search examines more leading Kalshi
+  events and searches Polymarket International and US separately. Lookups are
+  bounded; the page remains **partial coverage**, not every active market.
+- **No misleading AN model:** The AN column is still an experimental 50/50
+  fair-probability benchmark until the historical training and validation
+  stage is complete. Candidate matches remain explicitly unreviewed.
+- **New regression tests:** `test_v16.py` covers reordered presidential
+  nomination titles, different election propositions, reversed sports
+  participants, repeated fixture dates, and 24-hour-volume ranking.
+
+### Comparison with the reference site
+
+The reference source includes 24 server-rendered market cards and shows side-by-side
+exchange quotes for *some*, not every, event. It does not expose a full matching
+API, a public licensed bulk export or the source of its editorially normalized
+mappings. This app will not necessarily match its event count, its prices or
+its coverage without an independently maintained event registry, broader
+API ingestion and human contract-rule verification. Do not scrape and relay
+its live data as if it were the exchanges' independently retrieved prices.
+
+## Prior changes in v1.5
 
 - **`feeds.py`:** event-first **Polymarket US** integration at
   `https://gateway.polymarket.us/v1/events`, using nested `markets` and
@@ -111,7 +149,7 @@ one volume multiplied by the number of outcome quotes.
 
 ## Testing
 
-Run: `python -m pytest -q`. Latest run: **31 tests passed** using fixture data;
+Run: `python -m pytest -q`. Latest run: **39 tests passed** using fixture data;
 no live exchange API calls or Streamlit browser session were tested here.
 
 **Do not commit populated historical/private datasets or runtime SQLite files

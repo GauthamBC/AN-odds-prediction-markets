@@ -79,6 +79,7 @@ div[data-testid="stButton"] button:hover,div[data-testid="stDownloadButton"] but
 /* Comparable to screenshot #1 cards: compact, aligned and easy to scan. */
 .an-card {background:#11131e;border:1px solid #32364b;border-radius:13px;margin:4px 0 13px;padding:17px 17px 14px;min-height:238px;display:flex;flex-direction:column;}
 .an-card-head {display:flex;gap:12px;align-items:flex-start;min-height:58px;}
+.an-icon img{width:100%;height:100%;object-fit:cover;border-radius:8px;}
 .an-icon {width:46px;height:46px;flex:0 0 46px;display:flex;align-items:center;justify-content:center;border-radius:9px;background:linear-gradient(135deg,#493775,#292147);font-size:23px;}
 .an-heading{flex:1;min-width:0;}
 .an-card-title{font-size:14px;font-weight:800;color:#f6f8fe;letter-spacing:-.15px;line-height:1.35;overflow-wrap:anywhere;}
@@ -134,7 +135,7 @@ with st.sidebar:
                                 disabled=not include_us)
     us_bbo = st.select_slider("US price lookups for unpriced listings", options=[0, 10, 24, 50], value=24, disabled=not include_us,
                               help="US listings can omit prices. Optional read-only BBO lookups make separate requests and may take longer.")
-    st.caption("These controls set *scan limits*, not guaranteed totals. Feeds refresh from public endpoints every two minutes.")
+    st.caption("Scan limits are not total exchange inventory. Results refresh every two minutes. Markets missing a counterpart remain visible in All.")
     auto_search = st.checkbox("Find counterparts beyond scanned pages", value=True,
                               help="Fetch matching markets directly from official Polymarket search/slug endpoints. Uses a small number of extra API calls.")
     st.divider()
@@ -190,10 +191,13 @@ def targeted_discovery(kalshi_quotes, query, enabled=True):
     # child contract; a top-volume market can be absent from the Polymarket 24h scan.
     # Discovery never means automatic matching: the matching engine checks both sides.
     totals = {}
+    active = {}
     for q in kalshi_quotes:
         if q.category != 'Other':
             totals[q.event_title] = totals.get(q.event_title, 0) + q.volume
-    primary = sorted(totals, key=lambda t: -totals[t])[:6]
+            active[q.event_title] = active.get(q.event_title, 0) + q.volume_24h
+    # Trending events get priority; all-time volume is only a tie-breaker.
+    primary = sorted(totals, key=lambda t: (active.get(t,0)>0,active.get(t,0),totals[t]),reverse=True)[:12]
     if len(query.strip()) >= 5:
         token = query.strip().lower()
         # Give the user's active search priority over general top-volume coverage.
@@ -202,7 +206,7 @@ def targeted_discovery(kalshi_quotes, query, enabled=True):
         tasks.append(('search', title[:130]))
         if len([t for t in tasks if t[0]=='us_search'])<4:
             tasks.append(('us_search', title[:130]))
-    tasks = list(dict.fromkeys(tasks))[:15]
+    tasks = list(dict.fromkeys(tasks))[:24]
     rows, info, errors = [], [], []
     def execute(task):
         mode, argument = task
@@ -213,7 +217,7 @@ def targeted_discovery(kalshi_quotes, query, enabled=True):
             return result, mode + ':' + argument
         result, _ = fetch_polymarket_search(argument)
         return result, mode + ':' + argument
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(execute, t): t for t in tasks}
         for future in as_completed(futures):
             try:
@@ -226,7 +230,7 @@ def targeted_discovery(kalshi_quotes, query, enabled=True):
     return merge_quotes(rows), sorted(info), sorted(errors)
 
 st.markdown('''<div class="an-nav"><div class="an-nav-left"><div class="an-logo"><span class="an-logo-mark">A</span> ACTION NETWORK <span style="color:#8d9fbe;font-size:12px;font-weight:600">/ ODDS STUDIO</span></div><span class="an-nav-item active">Markets</span><span class="an-nav-item">Live intelligence</span></div><span class="an-nav-tag">INTERNAL PROTOTYPE</span></div>''', unsafe_allow_html=True)
-st.markdown('''<div class="an-head"><div class="an-title">Markets Dashboard</div><div class="an-subtitle">Browse active Kalshi and Polymarket markets side by side, with Action Network fair-odds estimates where outcomes can be matched.</div></div>''', unsafe_allow_html=True)
+st.markdown('''<div class="an-head"><div class="an-title">Markets Dashboard</div><div class="an-subtitle">Live Kalshi and Polymarket probabilities, combined by event and outcome. Provisional AN fair odds appear only on comparable markets.</div></div>''', unsafe_allow_html=True)
 
 with st.spinner("Retrieving active exchange markets…"):
     live, diagnostics, errors, refreshed = load_live(kalshi_pages, poly_pages, include_us, us_pages, us_bbo)
@@ -392,11 +396,16 @@ def card_markup(card):
     top = sorted_rows[:2]
     rest = sorted_rows[2:]
     icon = CATEGORY_ICONS.get(card.category, "✦")
+    # Reuse the exchange-supplied event image when available, never infer a
+    # candidate portrait from a generic name or an unrelated webpage.
+    photo = next((q.image_url for r in card.rows for q in (r.kalshi,r.polymarket)
+                  if q and q.image_url.startswith('https://')), '')
+    icon_markup = f'<img src="{escape(photo,quote=True)}" alt="" loading="lazy"/>' if photo else icon
     dates = [date_from_string(q.close_at) for r in card.rows for q in (r.kalshi, r.polymarket) if q and q.close_at]
     dates = [d for d in dates if d]
     close_label = min(dates).strftime("%b %-d, %Y") if dates else "Date unlisted"
     status = ('<span class="an-match-chip" title="Both exchange contracts have a reviewed event mapping">EVENT VERIFIED</span>' if card.rule_reviewed else '<span class="an-match-chip" title="Automated candidate match; settlement-rule review pending">POSSIBLE MATCH*</span>') if card.matched else ''
-    heading = f'''<div class="an-card-head"><span class="an-icon">{icon}</span><div class="an-heading"><div class="an-card-title">{escape(card.title)}</div><div class="an-meta">{escape(close_label)} · {escape(card.category)} {status}</div></div></div>'''
+    heading = f'''<div class="an-card-head"><span class="an-icon">{icon_markup}</span><div class="an-heading"><div class="an-card-title">{escape(card.title)}</div><div class="an-meta">{escape(close_label)} · {escape(card.category)} {status}</div></div></div>'''
     tablehead = '<thead><tr><th>OUTCOME</th><th class="an-kalshi-col">KALSHI</th><th class="an-poly-col">POLY</th><th class="an-an-col">AN MODEL</th></tr></thead>'
     main_table = f'<table class="an-table">{tablehead}<tbody>{rows_markup(top)}</tbody></table>'
     expanded = (
