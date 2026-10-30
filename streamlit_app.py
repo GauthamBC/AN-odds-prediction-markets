@@ -244,9 +244,49 @@ with st.sidebar:
     st.caption('Provider: TPM v1, Kalshi + Polymarket International. Polymarket US is NOT independently covered by this feed.')
     st.caption('Local SQLite cache survives reruns but may be erased when Streamlit Cloud restarts. For durable snapshots, add a hosted database later.')
 
+
 if not rows:
-    st.info('No saved market snapshot yet. Add TPM_API_KEY in Streamlit Secrets, open the sidebar and click “Refresh all active markets.” No API calls are made automatically.')
-    st.markdown('**Setup**: Streamlit Cloud → Your app → Settings → Secrets. Paste `TPM_API_KEY = "..."` and save. Optionally add `ADMIN_REFRESH_PASSWORD = "..."`.')
+    st.subheader("First-time market sync")
+
+    if not api_key:
+        st.error("TPM_API_KEY is missing from Streamlit Secrets.")
+    else:
+        st.success("API key detected.")
+
+        password_input = st.text_input(
+            "Admin password",
+            type="password",
+            key="first_sync_password"
+        )
+
+        unlocked = (
+            not admin_password
+            or password_input == admin_password
+        )
+
+        if st.button(
+            "Test API connection",
+            disabled=not unlocked
+        ):
+            try:
+                client = TPMClient(api_key)
+                result = client.get(
+                    "/events",
+                    {"status": "trading", "limit": 1}
+                )
+                st.success("API responded successfully.")
+            except TPMError as exc:
+                st.error(f"API error: {exc}")
+
+        if st.button(
+            "Refresh all active markets",
+            type="primary",
+            disabled=not unlocked
+        ):
+            run_refresh(con, api_key)
+            if snapshot(con):
+                st.rerun()
+
     st.stop()
 
 st.divider()
