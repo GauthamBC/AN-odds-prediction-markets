@@ -16,7 +16,7 @@ import pandas as pd
 import streamlit as st
 
 from core import CATEGORY_NAMES, american, date_from_string
-from feeds import FeedError, fetch_kalshi, fetch_polymarket
+from feeds import FeedError, fetch_kalshi, fetch_polymarket, fetch_polymarket_us
 from matching import combine_quotes
 from model import AccuracyModel, read_history
 
@@ -49,8 +49,8 @@ header[data-testid="stHeader"] {background:#0b0d16;}
 .an-head {margin:4px 0 13px;}
 .an-title {font-size:clamp(32px,3.55vw,43px);font-weight:850;letter-spacing:-1.7px;line-height:1.15;color:#f7f9ff;}
 .an-subtitle {color:#97a4bf;font-size:14px;margin-top:9px;line-height:1.55;}
-.an-sources {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;margin:16px 0 19px;}
-.an-source {background:#11131e;border:1px solid #34364d;border-radius:13px;min-height:112px;padding:20px 21px 17px;display:flex;flex-direction:column;justify-content:space-between;}
+.an-sources {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:13px 0 14px;}
+.an-source {background:#11131e;border:1px solid #34364d;border-radius:13px;min-height:102px;padding:16px 18px 15px;display:flex;flex-direction:column;justify-content:space-between;}
 .an-source-row {display:flex;align-items:center;justify-content:space-between;gap:8px;}
 .an-source-name{font-weight:850;font-size:21px;letter-spacing:-.6px;}
 .an-kname{color:#37d493;}.an-pname{color:#2690ff;}
@@ -105,6 +105,8 @@ div[data-testid="stButton"] button:hover,div[data-testid="stDownloadButton"] but
 .an-footnote {font-size:11px;color:#8495b4;line-height:1.65;margin:13px 0;}
 .an-blank {color:#9bb0cd;text-align:center;border:1px dashed #363c53;padding:24px;border-radius:12px;}
 .an-status-line{font-size:11px;color:#9eb0d0;}
+.an-poly-us{display:inline-block;background:#26447c;border:1px solid #4073bc;border-radius:4px;font-size:9px;color:#b9d8ff;padding:1px 4px;margin-left:5px;}
+.an-baseline{color:#f4c56b;font-size:10px;font-weight:600;padding:6px 0 2px;}
 @media(max-width:1150px){.an-card{padding:13px 11px 10px;}.an-val{min-width:43px;font-size:11px}.an-table th:first-child{width:43%;}.an-icon{width:38px;height:38px;flex-basis:38px;font-size:20px}.an-card-title{font-size:12px}}
 @media(max-width:790px){.block-container{padding:1rem .8rem 2rem;}.an-nav-left{gap:12px}.an-nav-item{display:none}.an-card{padding:14px}.an-card-title{font-size:14px}.an-sources{grid-template-columns:1fr;gap:9px}.an-source{min-height:85px;padding:13px}}
 </style>
@@ -116,47 +118,64 @@ HISTORY = BASE / "history.csv"
 ALIASES = BASE / "market_aliases.csv"
 
 with st.sidebar:
-    st.subheader("Data settings")
-    pages = st.select_slider(
-        "API pages per platform", options=[1, 2, 3, 5, 10, 20, 40, 80], value=5,
-        help="Higher page caps scan more active events, but slow initial loading and may hit rate limits.",
-    )
-    st.caption("Kalshi: up to 200 events/page. Polymarket: 100 events/page. Results are a partial scan unless pagination completes.")
+    st.subheader("Market coverage")
+    kalshi_pages = st.select_slider("Kalshi pages", options=[1, 2, 4, 8, 12, 20, 35, 60], value=8,
+                                     help="Up to 200 events per page. More pages increase load times.")
+    poly_pages = st.select_slider("Polymarket International pages", options=[1, 2, 4, 8, 12, 20, 35, 60], value=12,
+                                   help="Up to 100 events per page. Uses public Gamma API.")
+    include_us = st.checkbox("Include Polymarket US", value=True,
+                             help="Optional separate US feed. Its market coverage, identifiers and price availability differ from international Polymarket.")
+    us_pages = st.select_slider("Polymarket US pages", options=[1, 2, 4, 8, 12, 20], value=4,
+                                disabled=not include_us)
+    us_bbo = st.select_slider("US price lookups for unpriced listings", options=[0, 10, 24, 50], value=24, disabled=not include_us,
+                              help="US listings can omit prices. Optional read-only BBO lookups make separate requests and may take longer.")
+    st.caption("These controls set *scan limits*, not guaranteed totals. Feeds refresh from public endpoints every two minutes.")
     st.divider()
-    st.markdown("**Research model**")
-    st.caption("Historical period starts March 1, 2025. 18-month decay half-life. No validated category weights until sufficient actual settled outcomes are imported.")
-    st.caption("Archived markets are **not** shown on the live dashboard. They belong in history.csv for calibration.")
+    st.markdown("**Experimental AN model**")
+    st.caption("Historical start: March 1, 2025 · 18-month half-life. With no validated history, the AN column is an unvalidated 50/50 benchmark.")
+    st.caption("Resolved markets are kept out of the live dashboard; their pre-resolution prices and outcomes belong in history.csv.")
     st.divider()
-    st.markdown("**Official documentation**")
-    st.link_button("Kalshi API", "https://docs.kalshi.com/api-reference/events/get-events")
-    st.link_button("Polymarket Gamma", "https://docs.polymarket.com/")
+    st.link_button("Kalshi API docs", "https://docs.kalshi.com/api-reference/events/get-events")
+    st.link_button("Polymarket Intl API", "https://docs.polymarket.com/market-data/discover-markets")
+    st.link_button("Polymarket US docs", "https://docs.polymarket.us/data-guide/overview")
 
 @st.cache_data(ttl=120, show_spinner=False)
-def load_live(page_cap: int):
-    """Read-only, OPEN/ACTIVE markets. No settled listings are requested."""
-    quotes = {"Kalshi": [], "Polymarket": []}
+def load_live(k_pages: int, p_pages: int, us_on: bool, u_pages: int, bbo_limit: int):
+    """Fetch open markets only; settle/historical markets are not requested."""
+    quotes = {"Kalshi": [], "Polymarket": [], "Polymarket US": []}
     diagnostics = {}
     errors = {}
-    for platform, fn in (("Kalshi", fetch_kalshi), ("Polymarket", fetch_polymarket)):
+    feeds = [("Kalshi", fetch_kalshi, k_pages), ("Polymarket", fetch_polymarket, p_pages)]
+    if us_on:
+        feeds.append(("Polymarket US", fetch_polymarket_us, u_pages))
+    for platform, fn, n_pages in feeds:
         try:
-            quotes[platform], diagnostics[platform] = fn(page_cap)
+            quotes[platform], diagnostics[platform] = fn(n_pages, bbo_limit=bbo_limit) if platform=="Polymarket US" else fn(n_pages)
         except Exception as ex:
-            errors[platform] = str(ex)[:250]
-            diagnostics[platform] = {"events_scanned": 0, "complete": False}
+            errors[platform] = str(ex)[:270]
+            diagnostics[platform] = {"events_scanned": 0, "complete": False, "endpoint": "Unavailable"}
     return quotes, diagnostics, errors, datetime.now(timezone.utc).isoformat()
 
 st.markdown('''<div class="an-nav"><div class="an-nav-left"><div class="an-logo"><span class="an-logo-mark">A</span> ACTION NETWORK <span style="color:#8d9fbe;font-size:12px;font-weight:600">/ ODDS STUDIO</span></div><span class="an-nav-item active">Markets</span><span class="an-nav-item">Live intelligence</span></div><span class="an-nav-tag">INTERNAL PROTOTYPE</span></div>''', unsafe_allow_html=True)
 st.markdown('''<div class="an-head"><div class="an-title">Markets Dashboard</div><div class="an-subtitle">Browse active Kalshi and Polymarket markets side by side, with Action Network fair-odds estimates where outcomes can be matched.</div></div>''', unsafe_allow_html=True)
 
 with st.spinner("Retrieving active exchange markets…"):
-    live, diagnostics, errors, refreshed = load_live(pages)
+    live, diagnostics, errors, refreshed = load_live(kalshi_pages, poly_pages, include_us, us_pages, us_bbo)
 
 source_cards = []
-for src, cls in (("Kalshi", "an-kname"), ("Polymarket", "an-pname")):
-    n = len(live[src])
-    scan = diagnostics[src]
-    indicator = "FULL SCAN" if scan.get("complete") else "PARTIAL SCAN"
-    source_cards.append(f'''<div class="an-source"><div class="an-source-row"><span class="an-source-name {cls}">{src}</span><span class="an-source-count">{n:,} quotes</span></div><div class="an-source-caption">Active markets · {indicator} · {scan.get('events_scanned', 0):,} events scanned</div></div>''')
+scan = diagnostics.get("Kalshi", {})
+source_cards.append(
+    f'<div class="an-source"><div class="an-source-row"><span class="an-source-name an-kname">Kalshi</span>'
+    f'<span class="an-source-count">{len(live["Kalshi"]):,} quotes</span></div>'
+    f'<div class="an-source-caption">Active markets · {scan.get("events_scanned",0):,} events scanned · '
+    f'{"Complete" if scan.get("complete") else "Partial scan"}</div></div>'
+)
+p_int = len(live["Polymarket"]); p_us = len(live["Polymarket US"])
+source_cards.append(
+    f'<div class="an-source"><div class="an-source-row"><span class="an-source-name an-pname">Polymarket</span>'
+    f'<span class="an-source-count">{p_int+p_us:,} quotes</span></div>'
+    f'<div class="an-source-caption">International: {p_int:,} quotes · US: {p_us:,} quotes (separate venues)</div></div>'
+)
 st.markdown('<div class="an-sources">' + ''.join(source_cards) + '</div>', unsafe_allow_html=True)
 st.markdown('<div class="an-rule"></div>', unsafe_allow_html=True)
 
@@ -169,14 +188,14 @@ if ALIASES.exists():
             if k and p:
                 aliases[k] = p
 
-cards = combine_quotes(live["Kalshi"], live["Polymarket"], aliases)
+cards = combine_quotes(live["Kalshi"], live["Polymarket"] + live["Polymarket US"], aliases)
 model = AccuracyModel(read_history(HISTORY))
 matched_total = sum(1 for c in cards if c.matched)
 
 if errors:
     for name, error in errors.items():
         st.error(f"{name} live feed problem: {error}")
-if not live["Kalshi"] and not live["Polymarket"]:
+if not any(live.values()):
     st.warning("No active quotes could be loaded. Check the API connections and diagnostics below.")
 
 # All primary controls are on one neat toolbar, as in the reference dashboard.
@@ -184,7 +203,7 @@ t_search, t_source, t_layout, t_refresh = st.columns([4.6, 2.8, 1.5, .65], verti
 with t_search:
     search = st.text_input("Search markets", placeholder="⌕  Search markets or outcomes", key="market_search", label_visibility="collapsed")
 with t_source:
-    source_view = st.segmented_control("Source", ["All", "Kalshi", "Polymarket", "Matched"], default="All", key="source_view", label_visibility="collapsed")
+    source_view = st.segmented_control("Source", ["All", "Kalshi", "Polymarket", "Poly US", "Matched"], default="All", key="source_view", label_visibility="collapsed")
 with t_layout:
     layout = st.segmented_control("Layout", ["Grid", "Table"], default="Grid", key="market_layout", label_visibility="collapsed")
 with t_refresh:
@@ -214,11 +233,13 @@ for card in cards:
         continue
     if source_view == "Polymarket" and not has_p:
         continue
+    if source_view == "Poly US" and not any(r.polymarket and r.polymarket.exchange == "Polymarket US" for r in card.rows):
+        continue
     if source_view == "Matched" and not card.matched:
         continue
     filtered.append(card)
 
-scan_complete = all(diagnostics[name].get("complete") for name in ("Kalshi", "Polymarket"))
+scan_complete = bool(diagnostics) and all(d.get("complete") for d in diagnostics.values())
 coverage_label = "full pagination" if scan_complete else "partial API coverage"
 st.markdown(
     f'<div class="an-mini-info">Showing <b>{len(filtered):,}</b> active events from this snapshot · '
@@ -249,7 +270,8 @@ def quote_cell(quote, marker: str):
     if quote is None:
         return '<span class="an-empty-val">—</span>'
     p = quote.probability
-    return f'<span class="an-val {marker}">{escape(display_probability(p))}<span class="an-ml">{escape(american(p))}</span></span>'
+    venue = " · US" if quote.exchange == "Polymarket US" else ""
+    return f'<span class="an-val {marker}" title="{escape(quote.exchange,quote=True)}">{escape(display_probability(p))}<span class="an-ml">{escape(american(p))}{venue}</span></span>'
 
 
 def model_cell(kalshi, polymarket):
@@ -292,7 +314,7 @@ def card_markup(card):
     dates = [date_from_string(q.close_at) for r in card.rows for q in (r.kalshi, r.polymarket) if q and q.close_at]
     dates = [d for d in dates if d]
     close_label = min(dates).strftime("%b %-d, %Y") if dates else "Date unlisted"
-    status = '<span class="an-match-chip" title="Automated match; confirm the settlement rules">MATCHED*</span>' if card.matched else ""
+    status = '<span class="an-match-chip" title="Automated candidate match; contract rules require manual verification">MATCHED*</span>' if card.matched else ""
     heading = f'''<div class="an-card-head"><span class="an-icon">{icon}</span><div class="an-heading"><div class="an-card-title">{escape(card.title)}</div><div class="an-meta">{escape(close_label)} · {escape(card.category)} {status}</div></div></div>'''
     tablehead = '<thead><tr><th>OUTCOME</th><th class="an-kalshi-col">KALSHI</th><th class="an-poly-col">POLY</th><th class="an-an-col">AN MODEL</th></tr></thead>'
     main_table = f'<table class="an-table">{tablehead}<tbody>{rows_markup(top)}</tbody></table>'
@@ -307,19 +329,20 @@ def card_markup(card):
     if kalshi:
         source_info.append("K " + compact_volume(sum(q.volume for q in kalshi.values())) + " contracts")
     if poly:
-        source_info.append("P $" + compact_volume(sum(q.volume for q in poly.values())) + " vol")
+        venue = next(iter(poly.values())).exchange
+        source_info.append(("P-US " if venue == "Polymarket US" else "P $") + compact_volume(sum(q.volume for q in poly.values())) + " vol")
     source_links = []
     for source, group in (("Kalshi", kalshi), ("Polymarket", poly)):
         if group:
             first = next(iter(group.values()))
-            source_links.append(f'<a href="{escape(first.url, quote=True)}" target="_blank" rel="noopener noreferrer">{source} ↗</a>')
+            source_links.append(f'<a href="{escape(first.url, quote=True)}" target="_blank" rel="noopener noreferrer">{escape(first.exchange)} ↗</a>')
     foot = '<div class="an-card-bottom"><span class="an-source-tag">' + escape(" · ".join(source_info)) + '</span><span>' + " · ".join(source_links) + '</span></div>'
     return f'<div class="an-card">{heading}{main_table}{expanded}{foot}</div>'
 
 
 # Pagination follows the cards, not above them.
 PAGE_SIZE = 18
-filter_key = (search_normalized, chosen, source_view, layout, pages)
+filter_key = (search_normalized, chosen, source_view, layout, kalshi_pages, poly_pages, include_us, us_pages, us_bbo)
 if st.session_state.get("last_filter") != filter_key:
     st.session_state["last_filter"] = filter_key
     st.session_state["page"] = 1
@@ -404,14 +427,15 @@ with note_col:
 
 with st.expander("Data diagnostics and research methodology"):
     st.markdown("**Live data coverage**")
-    for source in ("Kalshi", "Polymarket"):
+    for source in diagnostics:
         d = diagnostics[source]
         st.write(
             f"- **{source}:** {len(live[source]):,} usable quotes from {d.get('events_scanned', 0):,} "
             f"events; {'complete' if d.get('complete') else 'partial'} scan. "
             f"Endpoint {d.get('endpoint', '/events')}."
         )
-    st.write(f"Potentially matched event pairs: **{matched_total:,}**. Matching is conservative and not a verification of identical settlement terms.")
+    st.write(f"Potentially matched event pairs: **{matched_total:,}**. These are candidate matches; settlement criteria still need verification.")
+    st.caption("Polymarket US and International are separate exchanges with different market lists and histories. Our calibration does not transfer accuracy estimates between the two.")
     st.markdown("**Live vs. historical markets**")
     st.markdown(
         "- **Main dashboard:** only open/active market API listings, refreshed on a 120-second cache. "

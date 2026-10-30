@@ -42,7 +42,7 @@ def read_history(path="history.csv", now=None):
                 cat = r["category"].strip()
                 if when is None or not HISTORY_START <= when < now or not 0 < p < 1 or y not in (0,1):
                     continue
-                if platform not in ("Kalshi", "Polymarket"):
+                if platform not in ("Kalshi", "Polymarket", "Polymarket US"):
                     continue
                 if cat not in ("Sports", "Politics", "Entertainment", "Crypto", "Economics", "Science & Tech", "Weather", "Other"):
                     cat = category(cat)
@@ -87,10 +87,10 @@ class AccuracyModel:
         correction = max(-.10, min(.10, correction))
         return max(.005, min(.995, p+correction)), True
 
-    def weights(self, cat, horizon):
+    def weights(self, cat, horizon, poly_source="Polymarket"):
         """Compare ONLY same event/outcome at same horizon, with enough distinct pairs."""
         a = self.sample(cat, horizon, "Kalshi")
-        b = self.sample(cat, horizon, "Polymarket")
+        b = self.sample(cat, horizon, poly_source)
         def d(rows):
             # Exactly one observation per event/horizon per platform.
             out = {}
@@ -126,8 +126,8 @@ class AccuracyModel:
         cat = kalshi.category
         horizon = remaining_horizon(kalshi.close_at or polymarket.close_at, self.now)
         kp, ck = self.calibrate("Kalshi", kalshi.probability, cat, horizon)
-        pp, cp = self.calibrate("Polymarket", polymarket.probability, cat, horizon)
-        wk, wp, n, qualified = self.weights(cat, horizon)
+        pp, cp = self.calibrate(polymarket.exchange, polymarket.probability, cat, horizon)
+        wk, wp, n, qualified = self.weights(cat, horizon, polymarket.exchange)
         forecast = wk*kp+wp*pp
         status = "Historical calibration (experimental)" if (qualified and ck and cp) else (
                  "Partial historical calibration" if (ck or cp or qualified) else "50/50 baseline — unvalidated")

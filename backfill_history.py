@@ -20,6 +20,7 @@ import sys
 import time
 from feeds import session, get_json, KALSHI, POLY, FeedError
 from core import category, date_from_string, parse_array, number, clean_text
+from matching import canonical_event_key
 
 START = datetime(2025, 3, 1,tzinfo=timezone.utc)
 DATA = Path(__file__).resolve().parent/'history.csv'
@@ -42,6 +43,11 @@ def get_price_kalshi(s, market, target):
                 bid=number((x.get('yes_bid') or {}).get('close'),-1)
                 ask=number((x.get('yes_ask') or {}).get('close'),-1)
                 last=number((x.get('price') or {}).get('close'),-1)
+                # Older API OHLC series may be quoted in cents; convert only
+                # when the numeric magnitude clearly indicates cent pricing.
+                if 1 < bid <= 100 and 1 < ask <= 100:
+                    bid,ask=bid/100,ask/100
+                if 1 < last <= 100:last=last/100
                 p=(bid+ask)/2 if 0<bid<=ask<1 else last
                 if 0<p<1:candidates.append((abs(int(observed)-t),observed,p))
             if candidates:break
@@ -106,6 +112,14 @@ def iter_poly(s,max_pages):
         if len(rows)<300:break
 
 
+def historical_event_key(title, outcome, cat):
+    """Standardize recognizable events; never assume similarly named contracts match rules."""
+    identifier=canonical_event_key(title,cat)
+    parent=':'.join(identifier) if identifier else clean_text(title)
+    outcome_key=clean_text(str(outcome).replace('.', ''))
+    return parent+'|'+outcome_key
+
+
 def build_row_kalshi(s,m):
     if m.get('result') not in ('yes','no'):return None
     closed=date_from_string(m.get('close_time'))
@@ -117,8 +131,9 @@ def build_row_kalshi(s,m):
     when,p=quote
     title=m.get('title') or ''
     outcome=m.get('yes_sub_title') or 'Yes'
-    key=clean_text(title)+'|'+clean_text(outcome)
-    return {'platform':'Kalshi','category':category(title),'event_key':key,
+    cat=category(title)
+    key=historical_event_key(title,outcome,cat)
+    return {'platform':'Kalshi','category':cat,'event_key':key,
             'observed_at':when.isoformat(),'probability':p,
             'outcome':1 if m['result']=='yes' else 0,'horizon':'2-7d'}
 
@@ -143,8 +158,9 @@ def build_row_poly(s,m):
     title=m.get('question') or ''
     event_list=m.get('events') or []
     title_event=event_list[0].get('title',title) if event_list and isinstance(event_list[0],dict) else title
-    key=clean_text(title_event)+'|'+clean_text(m.get('groupItemTitle') or 'Yes')
-    return {'platform':'Polymarket','category':category(title_event),'event_key':key,
+    cat=category(title_event)
+    key=historical_event_key(title_event,m.get('groupItemTitle') or 'Yes',cat)
+    return {'platform':'Polymarket','category':cat,'event_key':key,
             'observed_at':when.isoformat(),'probability':p,'outcome':1 if a>=.999 else 0,
             'horizon':'2-7d'}
 
